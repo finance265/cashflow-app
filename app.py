@@ -48,12 +48,12 @@ def get_account_items(token, company_id):
 
 def get_journals_by_account(token, company_id, account_item_id, start_date, end_date):
     """
-    仕訳帳APIで特定勘定科目の仕訳を全件取得
+    general_ledgers APIで特定勘定科目の仕訳明細を全件取得
     """
     all_rows = []
     offset   = 0
     while True:
-        d = freee_get("/journals", token, company_id, {
+        d = freee_get("/reports/general_ledgers", token, company_id, {
             "account_item_id": account_item_id,
             "start_date":      start_date,
             "end_date":        end_date,
@@ -64,7 +64,12 @@ def get_journals_by_account(token, company_id, account_item_id, start_date, end_
         if offset == 0 and account_item_id not in st.session_state.get("journal_samples", {}):
             st.session_state.setdefault("journal_samples", {})[account_item_id] = d
 
-        rows = d.get("journals", [])
+        # general_ledgers APIのレスポンス構造に対応
+        rows = (
+            d.get("account_item", {}).get("balances") or
+            d.get("balances") or
+            []
+        )
         all_rows.extend(rows)
         if len(rows) < 100:
             break
@@ -85,59 +90,38 @@ def get_walletable_balance(token, company_id, walletable_id, target_date):
 # ============================================================
 # 仕訳からCF行を抽出
 # ============================================================
-def extract_cf_line(journal_entry, bank_account_item_ids, id_to_name):
+def extract_cf_line(row, bank_account_item_ids, id_to_name):
     """
-    1仕訳エントリから預金が動いた行を抽出してCF行に変換
-    journal_entry の構造を確認しながら対応
+    general_ledgers の1行から CF行に変換
+    rowの構造: {
+      date, debit_amount, credit_amount, description,
+      partner_name, counter_account_name, counter_account_id, ...
+    }
     """
     results = []
+    debit  = row.get("debit_amount", 0) or 0
+    credit = row.get("credit_amount", 0) or 0
 
-    # freee journals APIのレスポンス構造に対応
-    # 仕訳の各行（details）を確認
-    details = journal_entry.get("details", [])
-    issue_date = journal_entry.get("issue_date", "")
-
-    if not details:
-        # detailsがない場合、journal_entry自体が1行の可能性
-        acct_id = journal_entry.get("account_item_id")
-        if acct_id in bank_account_item_ids:
-            entry_side = journal_entry.get("entry_side", "")
-            amount     = journal_entry.get("amount", 0) or 0
-            net        = amount if entry_side == "debit" else -amount
-            results.append({
-                "date":    issue_date or journal_entry.get("date", ""),
-                "amount":  net,
-                "partner": journal_entry.get("partner_name") or "",
-                "account": id_to_name.get(journal_entry.get("counter_account_item_id", 0), ""),
-                "description": journal_entry.get("description") or "",
-            })
+    if debit == 0 and credit == 0:
         return results
 
-    # 預金行と相手行に分ける
-    bank_lines  = [d for d in details if d.get("account_item_id") in bank_account_item_ids]
-    other_lines = [d for d in details if d.get("account_item_id") not in bank_account_item_ids]
+    # 預金の借方=入金, 貸方=出金
+    net = debit - credit
 
-    for bl in bank_lines:
-        entry_side = bl.get("entry_side", "")
-        amount     = bl.get("amount", 0) or 0
-        net        = amount if entry_side == "debit" else -amount
+    counter_account = (
+        row.get("counter_account_name") or
+        id_to_name.get(row.get("counter_account_item_id", 0), "") or
+        ""
+    )
+    partner = row.get("partner_name") or ""
 
-        # 相手科目
-        counter_account = ""
-        counter_partner = bl.get("partner_name") or journal_entry.get("partner_name") or ""
-        if other_lines:
-            best = max(other_lines, key=lambda x: x.get("amount", 0))
-            counter_account = best.get("account_item_name") or id_to_name.get(best.get("account_item_id", 0), "")
-            if best.get("partner_name"):
-                counter_partner = best.get("partner_name")
-
-        results.append({
-            "date":        issue_date,
-            "amount":      net,
-            "partner":     counter_partner,
-            "account":     counter_account,
-            "description": bl.get("description") or journal_entry.get("description") or "",
-        })
+    results.append({
+        "date":        row.get("date", ""),
+        "amount":      net,
+        "partner":     partner,
+        "account":     counter_account,
+        "description": row.get("description") or row.get("memo") or "",
+    })
     return results
 
 # ============================================================
