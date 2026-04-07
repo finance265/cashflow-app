@@ -34,8 +34,11 @@ def get_companies(token):
 
 def get_deposit_accounts(token, company_id):
     # 口座一覧APIから「銀行口座」カテゴリのみ取得
-    d = freee_get("/walletables", token, company_id, {"type": "bank"})
+    d = freee_get("/walletables", token, company_id)
     walletables = d.get("walletables", [])
+
+    # 銀行口座のみ絞り込み（type: "bank"）
+    bank_walletables = [w for w in walletables if w.get("type") == "bank"]
 
     # デバッグ用に保存
     st.session_state["all_account_items"] = [
@@ -43,9 +46,8 @@ def get_deposit_accounts(token, company_id):
         for w in walletables
     ]
 
-    # 勘定科目IDと名前のペアに変換（general_ledger APIで使うaccount_item_idが必要）
     result = []
-    for w in walletables:
+    for w in bank_walletables:
         if w.get("account_item_id"):
             result.append({
                 "id":   w["account_item_id"],
