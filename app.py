@@ -502,6 +502,12 @@ if generate_btn:
 
                 if rows and debug_mode:
                     debug_logs.append(f"サンプル行キー: {list(rows[0].keys()) if rows else 'なし'}")
+                    # 相手科目名の一覧を収集
+                    accounts = list(set(
+                        r.get("counter_account_name") or r.get("account_item_name") or "不明"
+                        for r in rows
+                    ))
+                    debug_logs.append(f"相手科目一覧: {', '.join(sorted(accounts))}")
 
                 for row in rows:
                     # freee APIの各種フィールド名に対応
@@ -588,47 +594,12 @@ if st.session_state.get("html_result"):
     if not has_diff:
         st.info("✅ 全月、freee残高との差異なし")
 
-    # ---- プレビューテーブル ----
+    # ---- プレビュー（iframeで実際のHTMLを表示）----
     st.subheader("📊 プレビュー")
-    col_labels = [f"{m['year']}年{m['month']}月" for m in months]
-
-    def pv(v):
-        if v == 0:
-            return "—"
-        if v < 0:
-            return f"▲ {abs(int(v)):,}"
-        return f"{int(v):,}"
-
-    rows_def = [
-        ("月初繰越残高 (A)",     "openingBalance", "bal"),
-        ("売上の入金",           "売上の入金",      "inc"),
-        ("収入計 (B)",           "収入計",          "sub_inc"),
-        ("原価",                 "原価",            "exp"),
-        ("広告宣伝費",           "広告宣伝費",      "exp"),
-        ("販管費（外注費含む）", "販管費",          "exp"),
-        ("人件費",               "人件費",          "exp"),
-        ("税金",                 "税金",            "exp"),
-        ("支出計 (C)",           "支出計",          "sub_exp"),
-        ("経常収支 (D)=(B)-(C)", "経常収支",        "total"),
-        ("借入による収入",       "借入による収入",  "inc"),
-        ("貸付の回収",           "貸付の回収",      "inc"),
-        ("財務収入計 (E)",       "財務収入計",      "sub_inc"),
-        ("貸付による支出",       "貸付による支出",  "exp"),
-        ("借入の返済",           "借入の返済",      "exp"),
-        ("財務支出計 (F)",       "財務支出計",      "sub_exp"),
-        ("財務収支 (G)=(E)-(F)", "財務収支",        "total"),
-        ("合計収支 (H)=(D)+(G)", "netCF",           "total"),
-        ("次月繰越残高 (I)",     "closingBalance",  "bal"),
-    ]
-
-    table_data = {}
-    for label, key, _ in rows_def:
-        table_data[label] = {col: pv(cf_data.get(str(m["year"]) + "-" + str(m["month"]), {}).get(key, 0)) for col, m in zip(col_labels, months)}
-
-    import pandas as pd
-    df = pd.DataFrame(table_data).T
-    df.columns = col_labels
-    st.dataframe(df, use_container_width=True)
+    import base64
+    html_b64 = base64.b64encode(html.encode("utf-8")).decode("utf-8")
+    iframe_src = f"data:text/html;base64,{html_b64}"
+    st.components.v1.html(html, height=800, scrolling=True)
 
     st.divider()
 
