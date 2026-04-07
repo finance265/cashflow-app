@@ -33,14 +33,31 @@ def get_companies(token):
     return res.json().get("companies", [])
 
 def get_deposit_accounts(token, company_id):
-    d = freee_get("/account_items", token, company_id)
-    items = d.get("account_items", [])
-    return [i for i in items if "預金" in i["name"] or "現金" in i["name"]]
+    # 口座一覧APIから「銀行口座」カテゴリのみ取得
+    d = freee_get("/walletables", token, company_id, {"type": "bank"})
+    walletables = d.get("walletables", [])
+
+    # デバッグ用に保存
+    st.session_state["all_account_items"] = [
+        {"id": w["id"], "name": w["name"], "type": w.get("type", ""), "account_item_id": w.get("account_item_id", "")}
+        for w in walletables
+    ]
+
+    # 勘定科目IDと名前のペアに変換（general_ledger APIで使うaccount_item_idが必要）
+    result = []
+    for w in walletables:
+        if w.get("account_item_id"):
+            result.append({
+                "id":   w["account_item_id"],
+                "name": w["name"],
+            })
+    return result
 
 def get_general_ledger(token, company_id, account_item_id, start_date, end_date):
     all_rows = []
     offset = 0
-    while True:
+    max_pages = 20  # 無限ループ防止
+    while offset < max_pages * 100:
         d = freee_get("/reports/general_ledgers", token, company_id, {
             "account_item_id": account_item_id,
             "start_date": start_date,
@@ -616,10 +633,17 @@ if st.session_state.get("html_result"):
     )
 
     # ---- デバッグ情報 ----
-    if debug_mode and st.session_state.get("debug_logs"):
-        with st.expander("🔍 デバッグログ"):
-            for log in st.session_state["debug_logs"]:
-                st.markdown(log)
+    if debug_mode:
+        if st.session_state.get("all_account_items"):
+            with st.expander("📋 freee全勘定科目一覧"):
+                import pandas as pd
+                df_acct = pd.DataFrame(st.session_state["all_account_items"])
+                st.dataframe(df_acct, use_container_width=True)
+                st.caption("この一覧から預金として使いたい科目名を確認してください")
+        if st.session_state.get("debug_logs"):
+            with st.expander("🔍 デバッグログ"):
+                for log in st.session_state["debug_logs"]:
+                    st.markdown(log)
         if st.session_state.get("last_ledger_response"):
             with st.expander("📦 freee APIレスポンス（最初の取得）"):
                 st.json(st.session_state["last_ledger_response"])
