@@ -465,7 +465,11 @@ if generate_btn:
         st.stop()
 
     if not deposit_items:
+        # デバッグ情報を先に表示してから止める
         st.error("預金科目が見つかりません")
+        if st.session_state.get("all_account_items"):
+            st.write("**取得できた口座一覧（デバッグ）:**")
+            st.json(st.session_state["all_account_items"])
         st.stop()
 
     debug_logs.append(f"**預金科目:** {', '.join(i['name'] for i in deposit_items)}")
