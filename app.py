@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import requests
 import json
 from datetime import date
@@ -596,10 +597,7 @@ if st.session_state.get("html_result"):
 
     # ---- プレビュー（iframeで実際のHTMLを表示）----
     st.subheader("📊 プレビュー")
-    import base64
-    html_b64 = base64.b64encode(html.encode("utf-8")).decode("utf-8")
-    iframe_src = f"data:text/html;base64,{html_b64}"
-    st.components.v1.html(html, height=800, scrolling=True)
+    components.html(html, height=800, scrolling=True)
 
     st.divider()
 
