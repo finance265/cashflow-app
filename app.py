@@ -195,24 +195,29 @@ def generate_html(cf_data, company_name, months, account_names, verify_data):
     col_headers = "".join(f"<th>{m['year']}年{m['month']}月</th>" for m in months)
 
     def cells(key):
-        return "".join(
-            f'<td class="num">{fmt(cf_data.get(f"{m[\"year\"]}-{m[\"month\"]}", {}).get(key, 0))}</td>'
-            for m in months
-        )
+        parts = []
+        for m in months:
+            mk = str(m["year"]) + "-" + str(m["month"])
+            v = cf_data.get(mk, {}).get(key, 0)
+            parts.append('<td class="num">' + fmt(v) + '</td>')
+        return "".join(parts)
 
     def bal_cells(key):
-        return "".join(
-            f'<td class="num bg-bal">{fmt_num(cf_data.get(f"{m[\"year\"]}-{m[\"month\"]}", {}).get(key, 0))}</td>'
-            for m in months
-        )
+        parts = []
+        for m in months:
+            mk = str(m["year"]) + "-" + str(m["month"])
+            v = cf_data.get(mk, {}).get(key, 0)
+            parts.append('<td class="num bg-bal">' + fmt_num(v) + '</td>')
+        return "".join(parts)
 
     def total_cells(key):
-        result = ""
+        parts = []
         for m in months:
-            v = cf_data.get(f"{m['year']}-{m['month']}", {}).get(key, 0)
+            mk = str(m["year"]) + "-" + str(m["month"])
+            v = cf_data.get(mk, {}).get(key, 0)
             cls = "v-neg" if v < 0 else "v-pos" if v > 0 else "v-zero"
-            result += f'<td class="num bg-gry {cls}">{fmt(v) if v != 0 else "0"}</td>'
-        return result
+            parts.append('<td class="num bg-gry ' + cls + '">' + (fmt(v) if v != 0 else "0") + '</td>')
+        return "".join(parts)
 
     cards = ""
     for m in months:
@@ -233,14 +238,16 @@ def generate_html(cf_data, company_name, months, account_names, verify_data):
       <div class="card-footer"><span class="card-footer-label">月次収支</span>{tag}</div>
     </div>"""
 
-    verify_freee = "".join(
-        f'<td class="num bg-vrf">{fmt_num(verify_data.get(f"{m[\"year\"]}-{m[\"month\"]}", 0))}</td>'
-        for m in months
-    )
-    verify_diff = "".join(
-        f'<td class="num bg-vrf">{fmt_diff((cf_data.get(f"{m[\"year\"]}-{m[\"month\"]}", {}).get("closingBalance", 0)) - (verify_data.get(f"{m[\"year\"]}-{m[\"month\"]}", 0)))}</td>'
-        for m in months
-    )
+    vf_parts = []
+    vd_parts = []
+    for m in months:
+        mk = str(m["year"]) + "-" + str(m["month"])
+        fb = verify_data.get(mk, 0)
+        cb = cf_data.get(mk, {}).get("closingBalance", 0)
+        vf_parts.append('<td class="num bg-vrf">' + fmt_num(fb) + '</td>')
+        vd_parts.append('<td class="num bg-vrf">' + fmt_diff(cb - fb) + '</td>')
+    verify_freee = "".join(vf_parts)
+    verify_diff  = "".join(vd_parts)
 
     return f"""<!DOCTYPE html>
 <html lang="ja">
