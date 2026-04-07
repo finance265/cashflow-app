@@ -4,10 +4,7 @@ import json
 from datetime import date
 from calendar import monthrange
 
-# ============================================================
-# ページ設定
-# ============================================================
-st.set_page_config(page_title="キャッシュフロー自動生成", page_icon="🏦", layout="centered")
+st.set_page_config(page_title="キャッシュフロー自動生成", page_icon="🏦", layout="wide")
 st.title("🏦 freee キャッシュフロー自動生成")
 st.caption("freee会計のデータから自動でキャッシュフロー表を作成します")
 
@@ -37,8 +34,8 @@ def get_companies(token):
 
 def get_deposit_accounts(token, company_id):
     d = freee_get("/account_items", token, company_id)
-    return [i for i in d.get("account_items", [])
-            if "預金" in i["name"] or "現金" in i["name"]]
+    items = d.get("account_items", [])
+    return [i for i in items if "預金" in i["name"] or "現金" in i["name"]]
 
 def get_general_ledger(token, company_id, account_item_id, start_date, end_date):
     all_rows = []
@@ -51,7 +48,17 @@ def get_general_ledger(token, company_id, account_item_id, start_date, end_date)
             "offset": offset,
             "limit": 100,
         })
-        rows = d.get("account_item", {}).get("balances", [])
+        # レスポンス構造をデバッグ用に保存
+        if offset == 0:
+            st.session_state["last_ledger_response"] = d
+
+        # freee APIのレスポンス構造に対応（複数パターン）
+        rows = (
+            d.get("account_item", {}).get("balances") or
+            d.get("balances") or
+            d.get("general_ledgers") or
+            []
+        )
         all_rows.extend(rows)
         if len(rows) < 100:
             break
@@ -59,92 +66,63 @@ def get_general_ledger(token, company_id, account_item_id, start_date, end_date)
     return all_rows
 
 # ============================================================
-# 分類ロジック（ルールベース）
+# 分類ロジック
 # ============================================================
-INCOME_ACCOUNTS  = ["売上高", "売掛金", "受取利息", "雑収入", "前受金"]
-COGS_ACCOUNTS    = ["仕入高", "原価", "材料費"]
-AD_ACCOUNTS      = ["広告宣伝費"]
-PAYROLL_ACCOUNTS = ["給与手当", "賞与", "役員報酬", "社会保険料", "労働保険"]
-TAX_ACCOUNTS     = ["法人税", "消費税", "源泉所得税", "住民税", "租税公課"]
-BORROW_IN        = ["短期借入金", "長期借入金"]
-LOAN_COLLECT     = ["貸付金回収"]
-LOAN_OUT         = ["貸付金"]
-BORROW_REPAY     = ["借入金返済", "支払利息"]
-
-PERSONAL_SUFFIXES = ["さん", "様"]
-
-def is_personal_name(name: str) -> bool:
-    """個人名かどうか判定"""
+def is_personal_name(name):
     if not name:
         return False
-    # 法人キーワードが含まれていれば法人
-    corporate_keywords = ["株式会社", "合同会社", "有限会社", "合名会社", "合資会社",
-                          "一般社団", "公益社団", "NPO", "社団法人", "財団法人",
-                          "事務所", "オフィス", "スタジオ", "ラボ", "工房", "商店"]
-    for kw in corporate_keywords:
+    corporate_kw = ["株式会社", "合同会社", "有限会社", "合名会社", "合資会社",
+                    "一般社団", "公益社団", "NPO", "社団法人", "財団法人",
+                    "事務所", "オフィス", "スタジオ", "ラボ", "工房", "商店", "inc", "Inc", "LLC"]
+    for kw in corporate_kw:
         if kw in name:
             return False
-    # 個人名サフィックス
-    for s in PERSONAL_SUFFIXES:
-        if name.endswith(s):
-            return True
-    # 2〜4文字の漢字のみ → 個人名の可能性が高い
     import re
-    if re.fullmatch(r'[\u4e00-\u9fff]{2,4}', name.replace("　", "").replace(" ", "")):
+    clean = name.replace("　", "").replace(" ", "")
+    if re.fullmatch(r'[\u4e00-\u9fff]{2,4}', clean):
         return True
     return False
 
-def classify_journal(journal: dict) -> str:
-    account = journal.get("account", "")
-    partner = journal.get("partner", "")
-    amount  = journal.get("amount", 0)
+def classify_journal(j):
+    account = j.get("account", "")
+    partner = j.get("partner", "")
+    amount  = j.get("amount", 0)
 
-    # 入金系
     if amount > 0:
-        for a in INCOME_ACCOUNTS:
-            if a in account:
+        for kw in ["売上", "売掛", "受取利息", "雑収入", "前受"]:
+            if kw in account:
                 return "売上の入金"
-        for a in BORROW_IN:
-            if a in account:
+        for kw in ["短期借入", "長期借入"]:
+            if kw in account:
                 return "借入による収入"
-        for a in LOAN_COLLECT:
-            if a in account:
+        for kw in ["貸付金"]:
+            if kw in account and "回収" in account:
                 return "貸付の回収"
-        return "売上の入金"  # デフォルト入金
+        return "売上の入金"
 
-    # 出金系
-    for a in COGS_ACCOUNTS:
-        if a in account:
+    for kw in ["仕入", "原価", "材料"]:
+        if kw in account:
             return "原価"
-    for a in AD_ACCOUNTS:
-        if a in account:
+    for kw in ["広告宣伝"]:
+        if kw in account:
             return "広告宣伝費"
-    for a in PAYROLL_ACCOUNTS:
-        if a in account:
+    for kw in ["給与", "賞与", "役員報酬", "社会保険", "労働保険"]:
+        if kw in account:
             return "人件費"
-    for a in TAX_ACCOUNTS:
-        if a in account:
+    for kw in ["法人税", "消費税", "源泉", "住民税", "租税"]:
+        if kw in account:
             return "税金"
-    for a in BORROW_REPAY:
-        if a in account:
+    for kw in ["支払利息", "借入金返済", "長期借入金", "短期借入金"]:
+        if kw in account:
             return "借入の返済"
-    for a in LOAN_OUT:
-        if a in account:
+    for kw in ["貸付"]:
+        if kw in account and "回収" not in account:
             return "貸付による支出"
-
-    # 外注費の個人名判定
     if "外注" in account or "業務委託" in account:
-        if is_personal_name(partner):
-            return "人件費"
-        return "販管費"
-
-    # 未払金など相手科目が不明な場合
+        return "人件費" if is_personal_name(partner) else "販管費"
     if "未払" in account or "立替" in account:
-        if is_personal_name(partner):
-            return "人件費"
-        return "販管費"
-
-    return "販管費"  # デフォルト出金
+        return "人件費" if is_personal_name(partner) else "販管費"
+    return "販管費"
 
 def aggregate(journals):
     cats = {
@@ -156,12 +134,12 @@ def aggregate(journals):
         cat = classify_journal(j)
         cats[cat] += j.get("amount", 0)
 
-    収入計   = cats["売上の入金"]
-    支出計   = sum(cats[k] for k in ["原価", "広告宣伝費", "販管費", "人件費", "税金"])
-    経常収支  = 収入計 + 支出計
-    財務収入計 = cats["借入による収入"] + cats["貸付の回収"]
-    財務支出計 = cats["貸付による支出"] + cats["借入の返済"]
-    財務収支  = 財務収入計 + 財務支出計
+    収入計    = cats["売上の入金"]
+    支出計    = sum(cats[k] for k in ["原価", "広告宣伝費", "販管費", "人件費", "税金"])
+    経常収支   = 収入計 + 支出計
+    財務収入計  = cats["借入による収入"] + cats["貸付の回収"]
+    財務支出計  = cats["貸付による支出"] + cats["借入の返済"]
+    財務収支   = 財務収入計 + 財務支出計
     netCF    = 経常収支 + 財務収支
 
     return {**cats,
@@ -173,63 +151,49 @@ def aggregate(journals):
 # HTML生成
 # ============================================================
 def generate_html(cf_data, company_name, months, account_names, verify_data):
-    today = date.today().isoformat()
-    period = f"{months[0]['year']}年{months[0]['month']}月 〜 {months[-1]['year']}年{months[-1]['month']}月"
-    account_str = "・".join(account_names)
+    today     = date.today().isoformat()
+    period    = f"{months[0]['year']}年{months[0]['month']}月 〜 {months[-1]['year']}年{months[-1]['month']}月"
+    acct_str  = "・".join(account_names)
+    n         = len(months)
 
-    def fmt(n):
-        if n is None or n == 0:
+    def fmt(v):
+        if v is None or v == 0:
             return '<span class="v-dash">—</span>'
-        if n < 0:
-            return f'<span class="v-exp">▲ {abs(int(n)):,}</span>'
-        return f'<span class="v-inc">{int(n):,}</span>'
+        if v < 0:
+            return f'<span class="v-exp">▲ {abs(int(v)):,}</span>'
+        return f'<span class="v-inc">{int(v):,}</span>'
 
-    def fmt_num(n):
-        return f"{int(n):,}" if n else "—"
+    def fmt_num(v):
+        return f"{int(v):,}" if v else "—"
 
-    def fmt_diff(n):
-        if n == 0:
-            return '<span class="v-ok">0 ✓</span>'
-        return f'<span class="v-ng">▲ {abs(int(n)):,} ✗</span>'
+    def fmt_diff(v):
+        return '<span class="v-ok">0 ✓</span>' if v == 0 else f'<span class="v-ng">▲ {abs(int(v)):,} ✗</span>'
 
-    col_headers = "".join(f"<th>{m['year']}年{m['month']}月</th>" for m in months)
+    def mk(m):
+        return str(m["year"]) + "-" + str(m["month"])
 
     def cells(key):
-        parts = []
-        for m in months:
-            mk = str(m["year"]) + "-" + str(m["month"])
-            v = cf_data.get(mk, {}).get(key, 0)
-            parts.append('<td class="num">' + fmt(v) + '</td>')
-        return "".join(parts)
+        return "".join('<td class="num">' + fmt(cf_data.get(mk(m), {}).get(key, 0)) + '</td>' for m in months)
 
     def bal_cells(key):
-        parts = []
-        for m in months:
-            mk = str(m["year"]) + "-" + str(m["month"])
-            v = cf_data.get(mk, {}).get(key, 0)
-            parts.append('<td class="num bg-bal">' + fmt_num(v) + '</td>')
-        return "".join(parts)
+        return "".join('<td class="num bg-bal">' + fmt_num(cf_data.get(mk(m), {}).get(key, 0)) + '</td>' for m in months)
 
     def total_cells(key):
         parts = []
         for m in months:
-            mk = str(m["year"]) + "-" + str(m["month"])
-            v = cf_data.get(mk, {}).get(key, 0)
+            v   = cf_data.get(mk(m), {}).get(key, 0)
             cls = "v-neg" if v < 0 else "v-pos" if v > 0 else "v-zero"
-            parts.append('<td class="num bg-gry ' + cls + '">' + (fmt(v) if v != 0 else "0") + '</td>')
+            parts.append(f'<td class="num bg-gry {cls}">' + (fmt(v) if v != 0 else "0") + '</td>')
         return "".join(parts)
 
     cards = ""
     for m in months:
-        d = cf_data.get(f"{m['year']}-{m['month']}", {})
-        net = d.get("netCF", 0)
+        d      = cf_data.get(mk(m), {})
+        net    = d.get("netCF", 0)
         closing = d.get("closingBalance", 0)
-        if net == 0:
-            tag = '<span class="tag-zero">± 0</span>'
-        elif net > 0:
-            tag = f'<span class="tag-pos">▲ {abs(int(net)):,}</span>'
-        else:
-            tag = f'<span class="tag-neg">▼ {abs(int(net)):,}</span>'
+        tag    = ('<span class="tag-zero">± 0</span>' if net == 0
+                  else f'<span class="tag-pos">▲ {abs(int(net)):,}</span>' if net > 0
+                  else f'<span class="tag-neg">▼ {abs(int(net)):,}</span>')
         cards += f"""
     <div class="card">
       <div class="card-month">{m['year']}年{m['month']}月</div>
@@ -238,16 +202,15 @@ def generate_html(cf_data, company_name, months, account_names, verify_data):
       <div class="card-footer"><span class="card-footer-label">月次収支</span>{tag}</div>
     </div>"""
 
-    vf_parts = []
+    vf = "".join('<td class="num bg-vrf">' + fmt_num(verify_data.get(mk(m), 0)) + '</td>' for m in months)
     vd_parts = []
     for m in months:
-        mk = str(m["year"]) + "-" + str(m["month"])
-        fb = verify_data.get(mk, 0)
-        cb = cf_data.get(mk, {}).get("closingBalance", 0)
-        vf_parts.append('<td class="num bg-vrf">' + fmt_num(fb) + '</td>')
+        cb = cf_data.get(mk(m), {}).get("closingBalance", 0)
+        fb = verify_data.get(mk(m), 0)
         vd_parts.append('<td class="num bg-vrf">' + fmt_diff(cb - fb) + '</td>')
-    verify_freee = "".join(vf_parts)
-    verify_diff  = "".join(vd_parts)
+    vd = "".join(vd_parts)
+
+    col_headers = "".join(f"<th>{m['year']}年{m['month']}月</th>" for m in months)
 
     return f"""<!DOCTYPE html>
 <html lang="ja">
@@ -264,7 +227,7 @@ def generate_html(cf_data, company_name, months, account_names, verify_data):
   .page-header .subtitle {{ font-size: 12px; color: #667085; margin-top: 3px; }}
   .page-header .meta {{ font-size: 11px; color: #98a2b3; text-align: right; }}
   .container {{ max-width: 980px; margin: 24px auto; padding: 0 20px 60px; }}
-  .cards {{ display: grid; grid-template-columns: repeat({len(months)}, 1fr); gap: 12px; margin-bottom: 24px; }}
+  .cards {{ display: grid; grid-template-columns: repeat({n}, 1fr); gap: 12px; margin-bottom: 24px; }}
   .card {{ background: #fff; border: 1px solid #d0d5dd; border-radius: 6px; padding: 16px 18px; border-top: 3px solid #4a90d9; }}
   .card .card-month {{ font-size: 12px; font-weight: 700; color: #344054; margin-bottom: 6px; }}
   .card .card-balance {{ font-size: 20px; font-weight: 700; margin-bottom: 8px; }}
@@ -316,7 +279,7 @@ def generate_html(cf_data, company_name, months, account_names, verify_data):
 <div class="page-header">
   <div>
     <div class="company">{company_name}　キャッシュフロー表</div>
-    <div class="subtitle">対象期間: {period}　｜　{account_str}（預金勘定）　｜　単位: 円</div>
+    <div class="subtitle">対象期間: {period}　｜　{acct_str}（預金勘定）　｜　単位: 円</div>
   </div>
   <div class="meta">出力日: {today}</div>
 </div>
@@ -336,24 +299,38 @@ def generate_html(cf_data, company_name, months, account_names, verify_data):
         <td class="g-label g-keijo" rowspan="8">経常収支</td>
         <td class="bg-inc"></td><td>売上の入金</td>{cells("売上の入金")}
       </tr>
-      <tr class="r-sub-inc"><td class="bg-inc"></td><td>収入計　(B)</td>{cells("収入計")}</tr>
+      <tr class="r-sub-inc">
+        <td class="bg-inc"></td><td>収入計　(B)</td>{cells("収入計")}
+      </tr>
       <tr class="r-normal"><td class="bg-exp"></td><td>原価</td>{cells("原価")}</tr>
       <tr class="r-normal"><td class="bg-exp"></td><td>広告宣伝費</td>{cells("広告宣伝費")}</tr>
       <tr class="r-normal"><td class="bg-exp"></td><td>販管費（外注費含む）</td>{cells("販管費")}</tr>
       <tr class="r-normal"><td class="bg-exp"></td><td>人件費</td>{cells("人件費")}</tr>
       <tr class="r-normal"><td class="bg-exp"></td><td>税金</td>{cells("税金")}</tr>
-      <tr class="r-sub-exp"><td class="bg-exp"></td><td>支出計　(C)</td>{cells("支出計")}</tr>
-      <tr class="r-total"><td class="bg-gry"></td><td>経常収支　(D)=(B)-(C)</td>{total_cells("経常収支")}</tr>
+      <tr class="r-sub-exp">
+        <td class="bg-exp"></td><td>支出計　(C)</td>{cells("支出計")}
+      </tr>
+      <tr class="r-total">
+        <td colspan="2" class="bg-gry"></td>
+        <td>経常収支　(D)=(B)-(C)</td>{total_cells("経常収支")}
+      </tr>
       <tr class="r-normal">
         <td class="g-label g-zaim" rowspan="7">財務収支</td>
         <td class="bg-inc"></td><td>借入による収入</td>{cells("借入による収入")}
       </tr>
       <tr class="r-normal"><td class="bg-inc"></td><td>貸付の回収</td>{cells("貸付の回収")}</tr>
-      <tr class="r-sub-inc"><td class="bg-inc"></td><td>財務収入計　(E)</td>{cells("財務収入計")}</tr>
+      <tr class="r-sub-inc">
+        <td class="bg-inc"></td><td>財務収入計　(E)</td>{cells("財務収入計")}
+      </tr>
       <tr class="r-normal"><td class="bg-exp"></td><td>貸付による支出</td>{cells("貸付による支出")}</tr>
       <tr class="r-normal"><td class="bg-exp"></td><td>借入の返済</td>{cells("借入の返済")}</tr>
-      <tr class="r-sub-exp"><td class="bg-exp"></td><td>財務支出計　(F)</td>{cells("財務支出計")}</tr>
-      <tr class="r-total"><td class="bg-gry"></td><td>財務収支　(G)=(E)-(F)</td>{total_cells("財務収支")}</tr>
+      <tr class="r-sub-exp">
+        <td class="bg-exp"></td><td>財務支出計　(F)</td>{cells("財務支出計")}
+      </tr>
+      <tr class="r-total">
+        <td colspan="2" class="bg-gry"></td>
+        <td>財務収支　(G)=(E)-(F)</td>{total_cells("財務収支")}
+      </tr>
       <tr class="r-total">
         <td colspan="2" class="bg-gry"></td>
         <td class="bg-gry">合計収支　(H)=(D)+(G)</td>{total_cells("netCF")}
@@ -364,11 +341,11 @@ def generate_html(cf_data, company_name, months, account_names, verify_data):
       </tr>
       <tr class="r-verify">
         <td colspan="2" class="bg-vrf"></td>
-        <td class="bg-vrf">freee実残高（{account_str}）</td>{verify_freee}
+        <td class="bg-vrf">freee実残高（{acct_str}）</td>{vf}
       </tr>
       <tr class="r-diff">
         <td colspan="2" class="bg-vrf"></td>
-        <td class="bg-vrf" style="color:#98a2b3;">差異（0=一致）</td>{verify_diff}
+        <td class="bg-vrf" style="color:#98a2b3;">差異（0=一致）</td>{vd}
       </tr>
     </tbody>
   </table>
@@ -388,14 +365,25 @@ def generate_html(cf_data, company_name, months, account_names, verify_data):
 # ============================================================
 with st.sidebar:
     st.header("⚙️ 設定")
-    token = st.text_input("freee アクセストークン", type="password", placeholder="トークンを入力")
-    st.caption("freee開発者ページで発行したトークンを入力してください")
+
+    # Secretsに保存済みのトークンを自動読み込み
+    saved_token = st.secrets.get("FREEE_TOKEN", "")
+
+    if saved_token:
+        st.success("✅ トークン読み込み済み")
+        use_saved = st.checkbox("保存済みトークンを使用", value=True)
+        if use_saved:
+            token = saved_token
+        else:
+            token = st.text_input("freee アクセストークン", type="password", placeholder="別のトークンを入力")
+    else:
+        token = st.text_input("freee アクセストークン", type="password", placeholder="トークンを入力")
+        st.caption("freee開発者ページで発行したトークンを入力してください")
 
 if not token:
     st.info("👈 左のサイドバーにfreeeのアクセストークンを入力してください")
     st.stop()
 
-# 事業所取得
 @st.cache_data(ttl=300)
 def load_companies(token):
     return get_companies(token)
@@ -408,23 +396,34 @@ except Exception as e:
 
 with st.sidebar:
     company_options = {c["display_name"]: c["id"] for c in companies}
-    selected_name = st.selectbox("事業所", list(company_options.keys()))
-    company_id = company_options[selected_name]
+    selected_name   = st.selectbox("事業所", list(company_options.keys()))
+    company_id      = company_options[selected_name]
 
     st.divider()
     st.subheader("📅 対象期間")
     col1, col2 = st.columns(2)
     with col1:
-        start_year  = st.selectbox("開始年", range(2020, date.today().year + 1), index=len(range(2020, date.today().year + 1)) - 1)
+        years       = list(range(2020, date.today().year + 1))
+        start_year  = st.selectbox("開始年", years, index=len(years) - 1)
         start_month = st.selectbox("開始月", range(1, 13), index=0)
     with col2:
-        end_year  = st.selectbox("終了年", range(2020, date.today().year + 1), index=len(range(2020, date.today().year + 1)) - 1)
-        end_month = st.selectbox("終了月", range(1, 13), index=1)
+        end_year    = st.selectbox("終了年", years, index=len(years) - 1)
+        end_month   = st.selectbox("終了月", range(1, 13), index=2)
 
     generate_btn = st.button("🚀 キャッシュフロー生成", use_container_width=True, type="primary")
 
+    st.divider()
+    debug_mode = st.checkbox("🔍 デバッグモード", value=False)
+
+# セッション状態の初期化
+if "html_result" not in st.session_state:
+    st.session_state["html_result"] = None
+if "cf_data" not in st.session_state:
+    st.session_state["cf_data"] = None
+if "months" not in st.session_state:
+    st.session_state["months"] = None
+
 if generate_btn:
-    # 月リスト生成
     months = []
     cy, cm = start_year, start_month
     while (cy, cm) <= (end_year, end_month):
@@ -435,26 +434,33 @@ if generate_btn:
             cy += 1
 
     progress = st.progress(0, text="準備中...")
-    cf_data = {}
+    cf_data  = {}
     verify_data = {}
+    debug_logs  = []
 
-    # 預金科目取得
     progress.progress(5, text="預金科目を取得中...")
-    deposit_items = get_deposit_accounts(token, company_id)
+    try:
+        deposit_items = get_deposit_accounts(token, company_id)
+    except Exception as e:
+        st.error(f"預金科目の取得に失敗: {e}")
+        st.stop()
+
     if not deposit_items:
         st.error("預金科目が見つかりません")
         st.stop()
+
+    debug_logs.append(f"**預金科目:** {', '.join(i['name'] for i in deposit_items)}")
 
     total_steps = len(months) * len(deposit_items)
     step = 0
 
     for i, mon in enumerate(months):
-        key = f"{mon['year']}-{mon['month']}"
+        key        = str(mon["year"]) + "-" + str(mon["month"])
         last_day   = monthrange(mon["year"], mon["month"])[1]
         start_date = f"{mon['year']}-{mon['month']:02d}-01"
         end_date   = f"{mon['year']}-{mon['month']:02d}-{last_day}"
 
-        all_journals = []
+        all_journals        = []
         freee_end_balance   = 0
         freee_start_balance = 0
 
@@ -465,29 +471,41 @@ if generate_btn:
 
             try:
                 rows = get_general_ledger(token, company_id, item["id"], start_date, end_date)
+                debug_logs.append(f"**{mon['year']}/{mon['month']} {item['name']}:** {len(rows)}件取得")
+
+                if rows and debug_mode:
+                    debug_logs.append(f"サンプル行キー: {list(rows[0].keys()) if rows else 'なし'}")
+
                 for row in rows:
-                    debit  = row.get("debit_amount", 0) or 0
-                    credit = row.get("credit_amount", 0) or 0
+                    # freee APIの各種フィールド名に対応
+                    debit  = row.get("debit_amount") or row.get("debit") or 0
+                    credit = row.get("credit_amount") or row.get("credit") or 0
                     if debit == 0 and credit == 0:
                         continue
-                    if row.get("opening_balance") is not None:
-                        freee_start_balance += row.get("opening_balance", 0) or 0
-                    if row.get("closing_balance") is not None:
-                        freee_end_balance = row.get("closing_balance", 0) or 0
+
+                    ob = row.get("opening_balance") or row.get("balance_before") or 0
+                    cb = row.get("closing_balance") or row.get("balance_after") or row.get("balance") or 0
+                    if ob:
+                        freee_start_balance += ob
+                    if cb:
+                        freee_end_balance = cb
+
                     all_journals.append({
-                        "date":    row.get("date", start_date),
+                        "date":    row.get("date") or row.get("issue_date") or start_date,
                         "amount":  debit - credit,
                         "description": row.get("description") or row.get("memo") or "",
-                        "partner": row.get("partner_name") or "",
-                        "account": row.get("counter_account_name") or "",
+                        "partner": row.get("partner_name") or row.get("partner") or "",
+                        "account": row.get("counter_account_name") or row.get("account_item_name") or "",
                         "accountItem": item["name"],
                     })
             except Exception as e:
                 st.warning(f"{item['name']}: {e}")
+                debug_logs.append(f"⚠ エラー: {e}")
+
+        debug_logs.append(f"**{mon['year']}/{mon['month']} 合計:** {len(all_journals)}件、推定月末残高: {freee_end_balance:,}円")
 
         if all_journals:
-            progress.progress(pct, text=f"{mon['year']}年{mon['month']}月 分類中...")
-            agg = aggregate(all_journals)
+            agg     = aggregate(all_journals)
             opening = freee_start_balance
             closing = freee_end_balance if freee_end_balance else opening + agg["netCF"]
             agg["openingBalance"] = opening
@@ -500,8 +518,8 @@ if generate_btn:
 
     # 月初残高を連鎖
     for i in range(1, len(months)):
-        pk = f"{months[i-1]['year']}-{months[i-1]['month']}"
-        ck = f"{months[i]['year']}-{months[i]['month']}"
+        pk = str(months[i-1]["year"]) + "-" + str(months[i-1]["month"])
+        ck = str(months[i]["year"])   + "-" + str(months[i]["month"])
         if pk in cf_data and ck in cf_data:
             cf_data[ck]["openingBalance"] = cf_data[pk]["closingBalance"]
 
@@ -509,28 +527,99 @@ if generate_btn:
     account_names = [i["name"] for i in deposit_items]
     html = generate_html(cf_data, selected_name, months, account_names, verify_data)
 
-    progress.progress(100, text="完了！")
-    st.success("✅ キャッシュフロー表が生成されました！")
+    # セッションに保存
+    st.session_state["html_result"]  = html
+    st.session_state["cf_data"]      = cf_data
+    st.session_state["months"]       = months
+    st.session_state["verify_data"]  = verify_data
+    st.session_state["debug_logs"]   = debug_logs
+    st.session_state["period_str"]   = f"{start_year}{start_month:02d}-{end_year}{end_month:02d}"
 
-    # 差異チェック表示
+    progress.progress(100, text="完了！")
+
+# ============================================================
+# 結果表示（プレビュー）
+# ============================================================
+if st.session_state.get("html_result"):
+    html        = st.session_state["html_result"]
+    cf_data     = st.session_state["cf_data"]
+    months      = st.session_state["months"]
+    verify_data = st.session_state.get("verify_data", {})
+    period_str  = st.session_state.get("period_str", "output")
+
+    st.success("✅ キャッシュフロー表が生成されました！内容を確認してからダウンロードしてください。")
+
+    # 残高照合チェック
     has_diff = False
     for mon in months:
-        key = f"{mon['year']}-{mon['month']}"
-        closing = cf_data.get(key, {}).get("closingBalance", 0)
-        freee_b = verify_data.get(key, 0)
-        diff = closing - freee_b
-        if abs(diff) > 0 and freee_b > 0:
-            st.warning(f"⚠ {mon['year']}年{mon['month']}月: freee残高との差異 {diff:,}円")
+        key = str(mon["year"]) + "-" + str(mon["month"])
+        cb  = cf_data.get(key, {}).get("closingBalance", 0)
+        fb  = verify_data.get(key, 0)
+        if abs(cb - fb) > 0 and fb > 0:
+            st.warning(f"⚠ {mon['year']}年{mon['month']}月: freee残高との差異 {cb - fb:,}円")
             has_diff = True
     if not has_diff:
         st.info("✅ 全月、freee残高との差異なし")
 
-    # ダウンロードボタン
-    period_str = f"{start_year}{start_month:02d}-{end_year}{end_month:02d}"
+    # ---- プレビューテーブル ----
+    st.subheader("📊 プレビュー")
+    col_labels = [f"{m['year']}年{m['month']}月" for m in months]
+
+    def pv(v):
+        if v == 0:
+            return "—"
+        if v < 0:
+            return f"▲ {abs(int(v)):,}"
+        return f"{int(v):,}"
+
+    rows_def = [
+        ("月初繰越残高 (A)",     "openingBalance", "bal"),
+        ("売上の入金",           "売上の入金",      "inc"),
+        ("収入計 (B)",           "収入計",          "sub_inc"),
+        ("原価",                 "原価",            "exp"),
+        ("広告宣伝費",           "広告宣伝費",      "exp"),
+        ("販管費（外注費含む）", "販管費",          "exp"),
+        ("人件費",               "人件費",          "exp"),
+        ("税金",                 "税金",            "exp"),
+        ("支出計 (C)",           "支出計",          "sub_exp"),
+        ("経常収支 (D)=(B)-(C)", "経常収支",        "total"),
+        ("借入による収入",       "借入による収入",  "inc"),
+        ("貸付の回収",           "貸付の回収",      "inc"),
+        ("財務収入計 (E)",       "財務収入計",      "sub_inc"),
+        ("貸付による支出",       "貸付による支出",  "exp"),
+        ("借入の返済",           "借入の返済",      "exp"),
+        ("財務支出計 (F)",       "財務支出計",      "sub_exp"),
+        ("財務収支 (G)=(E)-(F)", "財務収支",        "total"),
+        ("合計収支 (H)=(D)+(G)", "netCF",           "total"),
+        ("次月繰越残高 (I)",     "closingBalance",  "bal"),
+    ]
+
+    table_data = {}
+    for label, key, _ in rows_def:
+        table_data[label] = {col: pv(cf_data.get(str(m["year"]) + "-" + str(m["month"]), {}).get(key, 0)) for col, m in zip(col_labels, months)}
+
+    import pandas as pd
+    df = pd.DataFrame(table_data).T
+    df.columns = col_labels
+    st.dataframe(df, use_container_width=True)
+
+    st.divider()
+
+    # ---- ダウンロードボタン ----
     st.download_button(
         label="⬇️ HTMLをダウンロード",
         data=html.encode("utf-8"),
         file_name=f"cashflow_{period_str}.html",
         mime="text/html",
         use_container_width=True,
+        type="primary",
     )
+
+    # ---- デバッグ情報 ----
+    if debug_mode and st.session_state.get("debug_logs"):
+        with st.expander("🔍 デバッグログ"):
+            for log in st.session_state["debug_logs"]:
+                st.markdown(log)
+        if st.session_state.get("last_ledger_response"):
+            with st.expander("📦 freee APIレスポンス（最初の取得）"):
+                st.json(st.session_state["last_ledger_response"])
