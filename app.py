@@ -33,12 +33,8 @@ def get_companies(token):
     return res.json().get("companies", [])
 
 def get_deposit_accounts(token, company_id):
-    # 口座一覧APIから「銀行口座」カテゴリのみ取得
     d = freee_get("/walletables", token, company_id)
     walletables = d.get("walletables", [])
-
-    # 銀行口座のみ絞り込み（type: "bank"）
-    bank_walletables = [w for w in walletables if w.get("type") == "bank"]
 
     # デバッグ用に保存
     st.session_state["all_account_items"] = [
@@ -46,32 +42,40 @@ def get_deposit_accounts(token, company_id):
         for w in walletables
     ]
 
-    result = []
-    for w in bank_walletables:
-        if w.get("account_item_id"):
-            result.append({
-                "id":   w["account_item_id"],
-                "name": w["name"],
-            })
-    return result
+    # 銀行口座のみ絞り込み（type: "bank_account"）
+    return [
+        {"id": w["id"], "name": w["name"], "walletable": True}
+        for w in walletables if w.get("type") == "bank_account"
+    ]
 
-def get_general_ledger(token, company_id, account_item_id, start_date, end_date):
+def get_general_ledger(token, company_id, account_item_id, start_date, end_date, walletable=False):
     all_rows = []
     offset = 0
-    max_pages = 20  # 無限ループ防止
+    max_pages = 20
     while offset < max_pages * 100:
-        d = freee_get("/reports/general_ledgers", token, company_id, {
-            "account_item_id": account_item_id,
-            "start_date": start_date,
-            "end_date": end_date,
-            "offset": offset,
-            "limit": 100,
-        })
-        # レスポンス構造をデバッグ用に保存
+        if walletable:
+            # walletable_idで取得する場合
+            params = {
+                "walletable_type": "bank_account",
+                "walletable_id": account_item_id,
+                "start_date": start_date,
+                "end_date": end_date,
+                "offset": offset,
+                "limit": 100,
+            }
+        else:
+            params = {
+                "account_item_id": account_item_id,
+                "start_date": start_date,
+                "end_date": end_date,
+                "offset": offset,
+                "limit": 100,
+            }
+        d = freee_get("/reports/general_ledgers", token, company_id, params)
+
         if offset == 0:
             st.session_state["last_ledger_response"] = d
 
-        # freee APIのレスポンス構造に対応（複数パターン）
         rows = (
             d.get("account_item", {}).get("balances") or
             d.get("balances") or
@@ -493,7 +497,7 @@ if generate_btn:
             progress.progress(pct, text=f"{mon['year']}年{mon['month']}月 / {item['name']} 取得中...")
 
             try:
-                rows = get_general_ledger(token, company_id, item["id"], start_date, end_date)
+                rows = get_general_ledger(token, company_id, item["id"], start_date, end_date, walletable=item.get("walletable", False))
                 debug_logs.append(f"**{mon['year']}/{mon['month']} {item['name']}:** {len(rows)}件取得")
 
                 if rows and debug_mode:
