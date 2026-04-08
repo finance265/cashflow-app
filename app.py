@@ -785,8 +785,10 @@ if generate_btn:
         # サンプルをcf_dataに含めて保存
         agg["closingBalance"] = closing
         agg["openingBalance"] = 0
-        agg["_sample_deal"]           = st.session_state.pop("sample_deal", None)
-        agg["_sample_manual_journal"] = st.session_state.pop("sample_manual_journal", None)
+        # 生データをcf_dataに保存
+        if i == 0:
+            agg["_sample_manual_journal"] = st.session_state.pop("_raw_manual_journal", None)
+            agg["_sample_deal"]           = st.session_state.pop("_raw_deal", None)
         cf_data[key]     = agg
         verify_data[key] = closing
 
@@ -847,7 +849,6 @@ if st.session_state.get("html_result"):
     )
 
     if debug_mode:
-        # 最初の月のサンプルを表示
         first_key = str(months[0]["year"]) + "-" + str(months[0]["month"])
         first_d   = cf_data.get(first_key, {})
 
@@ -855,16 +856,20 @@ if st.session_state.get("html_result"):
         sample_dl = first_d.get("_sample_deal")
 
         if sample_mj:
-            with st.expander("🔍 振替伝票サンプル（生データ）"):
+            with st.expander("🔍 振替伝票サンプル（一覧取得）"):
                 st.json(sample_mj)
         else:
-            st.warning("振替伝票サンプルなし（manual_journalsが取得できていない可能性）")
+            st.warning("振替伝票サンプルなし")
+
+        if st.session_state.get("_raw_manual_journal_full"):
+            with st.expander("🔍 振替伝票サンプル（個別取得・details確認用）"):
+                st.json(st.session_state["_raw_manual_journal_full"])
 
         if sample_dl:
             with st.expander("🔍 取引サンプル（生データ）"):
                 st.json(sample_dl)
         else:
-            st.warning("取引サンプルなし（dealsが取得できていない可能性）")
+            st.warning("取引サンプルなし")
 
         for mon in months:
             key = str(mon["year"]) + "-" + str(mon["month"])
