@@ -2,8 +2,82 @@ import streamlit as st
 import streamlit.components.v1 as components
 import requests
 import re
+import json
+import os
+import urllib.parse
 from datetime import date, timedelta
 from calendar import monthrange
+
+# ============================================================
+# トークンファイル永続化
+# ============================================================
+TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".freee_tokens.json")
+
+def _load_token_file() -> dict:
+    try:
+        with open(TOKEN_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_token_file(access_token: str, refresh_token: str):
+    try:
+        with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+            json.dump({"access_token": access_token,
+                       "refresh_token": refresh_token,
+                       "saved_at": date.today().isoformat()}, f)
+    except Exception:
+        pass  # Streamlit Cloud など書き込めない環境ではスキップ
+
+def get_oauth_url() -> str:
+    """freee OAuth 認証URL を生成"""
+    params = {
+        "response_type": "code",
+        "client_id":     st.secrets.get("FREEE_CLIENT_ID", ""),
+        "redirect_uri":  st.secrets.get("REDIRECT_URI", ""),
+        "prompt":        "select_company",
+    }
+    return "https://accounts.secure.freee.co.jp/public_api/authorize?" + urllib.parse.urlencode(params)
+
+def exchange_code_for_tokens(code: str) -> dict:
+    """認証コード → アクセストークン＋リフレッシュトークン"""
+    res = requests.post(
+        "https://accounts.secure.freee.co.jp/public_api/token",
+        data={
+            "grant_type":    "authorization_code",
+            "client_id":     st.secrets.get("FREEE_CLIENT_ID", ""),
+            "client_secret": st.secrets.get("FREEE_CLIENT_SECRET", ""),
+            "code":          code,
+            "redirect_uri":  st.secrets.get("REDIRECT_URI", ""),
+        },
+        timeout=15,
+    )
+    return res.json()
+
+# ── 起動時に OAuth コールバック（?code=XXX）を処理 ──────────────
+_qp = st.query_params
+if "code" in _qp and not st.session_state.get("_oauth_done"):
+    with st.spinner("freeeと認証中..."):
+        _data = exchange_code_for_tokens(_qp["code"])
+    if _data.get("access_token"):
+        st.session_state["stored_access_token"]  = _data["access_token"]
+        st.session_state["stored_refresh_token"] = _data.get("refresh_token", "")
+        _save_token_file(_data["access_token"], _data.get("refresh_token", ""))
+        st.session_state["_oauth_done"] = True
+        st.query_params.clear()          # URLから ?code= を除去
+        st.rerun()
+    else:
+        err = _data.get("error_description") or _data.get("error") or str(_data)
+        st.error(f"freee認証エラー: {err}")
+        st.query_params.clear()
+
+# ── セッション未保持なら token_file から復元 ─────────────────────
+if not st.session_state.get("stored_refresh_token"):
+    _file = _load_token_file()
+    if _file.get("refresh_token"):
+        st.session_state["stored_refresh_token"] = _file["refresh_token"]
+    if _file.get("access_token") and not st.session_state.get("stored_access_token"):
+        st.session_state["stored_access_token"] = _file["access_token"]
 
 st.set_page_config(page_title="キャッシュフロー自動生成", page_icon="🏦", layout="wide")
 
@@ -47,7 +121,11 @@ def refresh_access_token():
         st.session_state.get("stored_refresh_token") or
         st.secrets.get("FREEE_REFRESH_TOKEN", "")
     )
-    if not all([client_id, client_secret, refresh_token]):
+    missing = [k for k, v in [("FREEE_CLIENT_ID", client_id),
+                               ("FREEE_CLIENT_SECRET", client_secret),
+                               ("FREEE_REFRESH_TOKEN", refresh_token)] if not v]
+    if missing:
+        st.session_state["_token_error"] = f"Secrets未設定: {', '.join(missing)}"
         return None
     try:
         res = requests.post(TOKEN_URL, data={
@@ -56,13 +134,20 @@ def refresh_access_token():
             "client_secret": client_secret,
             "refresh_token": refresh_token,
         }, timeout=10)
-        res.raise_for_status()
         data = res.json()
+        if res.status_code != 200:
+            err = data.get("error_description") or data.get("error") or res.text
+            st.session_state["_token_error"] = f"HTTP {res.status_code}: {err}"
+            # 認証エラー(401/400)のときだけ stored_refresh_token を破棄
+            if res.status_code in (400, 401):
+                st.session_state.pop("stored_refresh_token", None)
+            return None
         if data.get("refresh_token"):
             st.session_state["stored_refresh_token"] = data["refresh_token"]
+        st.session_state.pop("_token_error", None)
         return data.get("access_token")
-    except:
-        st.session_state.pop("stored_refresh_token", None)
+    except Exception as e:
+        st.session_state["_token_error"] = f"通信エラー: {e}"
         return None
 
 # ============================================================
@@ -626,16 +711,26 @@ def generate_html(cf_data, company_name, months, bank_names, verify_data):
 # ============================================================
 with st.sidebar:
     st.header("⚙️ 設定")
-    token = None
-    if st.secrets.get("FREEE_REFRESH_TOKEN"):
-        token = refresh_access_token()
-        if token:
-            st.success("✅ トークン自動更新済み")
-        else:
-            st.error("❌ 自動更新失敗")
-            token = st.text_input("freee アクセストークン", type="password")
+    token = refresh_access_token()
+    if token:
+        st.success("✅ freee 連携済み")
     else:
-        token = st.text_input("freee アクセストークン", type="password", placeholder="トークンを入力")
+        err_msg = st.session_state.get("_token_error", "")
+        if err_msg:
+            st.warning(f"⚠ {err_msg}")
+        # OAuth 連携ボタン（client_id と redirect_uri が設定済みの場合のみ表示）
+        if st.secrets.get("FREEE_CLIENT_ID") and st.secrets.get("REDIRECT_URI"):
+            auth_url = get_oauth_url()
+            st.link_button("🔗 freeeと連携する", auth_url, use_container_width=True)
+            st.caption("クリックするとfreeeの認証画面に移動します。\n"
+                       "認証完了後このページに自動で戻ります。")
+        else:
+            st.caption("FREEE_CLIENT_ID / REDIRECT_URI を Secrets に設定すると\n"
+                       "ワンクリック連携が使えます。")
+        with st.expander("🔑 アクセストークンを手動入力"):
+            token = st.text_input("freee アクセストークン", type="password",
+                                  key="manual_token")
+            st.caption("freee管理画面 → 連携アプリ → アクセストークンをコピー")
 
 if not token:
     st.info("👈 左のサイドバーにfreeeのアクセストークンを入力してください")
