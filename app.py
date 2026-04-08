@@ -820,6 +820,11 @@ if st.session_state.get("html_result"):
     )
 
     if debug_mode:
+        # 振替伝票の生データを表示（最重要）
+        if st.session_state.get("sample_manual_journal"):
+            with st.expander("🔍 振替伝票サンプル（生データ）"):
+                st.json(st.session_state["sample_manual_journal"])
+
         for mon in months:
             key = str(mon["year"]) + "-" + str(mon["month"])
             d   = cf_data.get(key, {})
