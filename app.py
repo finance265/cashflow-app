@@ -225,19 +225,66 @@ def _paginate(path, key, token, company_id, params):
 
 def get_all_transactions(token, company_id, bank_account_item_ids, start_date, end_date, acct_map,
                          debug=False):
-    """deals + manual_journals を日付範囲で一括取得し、銀行口座が含まれる仕訳のみ返す。"""
-    params      = {"start_issue_date": start_date, "end_issue_date": end_date}
-    all_entries = []
+    """deals + manual_journals を全件取得。
+    Returns: (bank_entries, payable_lookup)
+      bank_entries   : 銀行口座が含まれる仕訳のリスト
+      payable_lookup : {partner_name: expense_account_name} — 未払金経由払いの費用科目マップ
+    """
+    params = {"start_issue_date": start_date, "end_issue_date": end_date}
+    bank_entries   = []
+    payable_lookup = {}  # partner_name → expense_account_name
+
+    PAYABLE_ACCTS = {"未払金", "未払費用", "BD興行未払金", "スクール未払金", "未払消費税等", "未払法人税等"}
+
+    def _resolve_name(aid, name):
+        if name:
+            return name
+        return acct_map.get(aid, {}).get("name", "") if aid else ""
 
     def _norm_details(details, has_account_name=True):
         out = []
         for det in details:
             aid   = det.get("account_item_id")
-            name  = (det.get("account_item_name") if has_account_name else None) \
-                    or (acct_map.get(aid, {}).get("name", "") if aid else "")
+            name  = _resolve_name(aid, det.get("account_item_name") if has_account_name else None)
             pname = det.get("partner_name") or det.get("partner_long_name") or ""
             out.append({**det, "account_item_name": name, "partner_name": pname})
         return out
+
+    def _update_payable_lookup(norm_details, deal_partner=""):
+        """未払金 credit / 費用 debit の仕訳から payable_lookup を構築"""
+        # bank が含まれる仕訳はスキップ（別途 bank_entries として処理）
+        if any(d.get("account_item_id") in bank_account_item_ids for d in norm_details):
+            return
+        credits = [d for d in norm_details if d.get("entry_side") == "credit"]
+        debits  = [d for d in norm_details if d.get("entry_side") == "debit"]
+        # 未払金が credit 側にあるか確認
+        payable_credits = [d for d in credits if d.get("account_item_name", "") in PAYABLE_ACCTS]
+        if not payable_credits:
+            return
+        # debit 側の費用科目を特定（未払金・銀行以外）
+        expense_debits = [
+            d for d in debits
+            if d.get("account_item_name", "") not in PAYABLE_ACCTS
+            and d.get("account_item_id") not in bank_account_item_ids
+        ]
+        if not expense_debits:
+            return
+        best_debit = max(expense_debits, key=lambda x: x.get("amount", 0) or 0)
+        exp_name   = best_debit.get("account_item_name", "")
+        if not exp_name:
+            return
+        # partner 候補を収集して lookup に登録（上書きしない）
+        partners = set()
+        for pc in payable_credits:
+            p = pc.get("partner_name") or deal_partner
+            if p:
+                partners.add(p)
+        p2 = best_debit.get("partner_name") or deal_partner
+        if p2:
+            partners.add(p2)
+        for p in partners:
+            if p and p not in payable_lookup:
+                payable_lookup[p] = exp_name
 
     # ---- deals ----
     deals_raw = 0
@@ -246,14 +293,17 @@ def get_all_transactions(token, company_id, bank_account_item_ids, start_date, e
         deals = _paginate("/deals", "deals", token, company_id, params)
         deals_raw = len(deals)
         for deal in deals:
-            raw_details = deal.get("details", [])
+            raw_details  = deal.get("details", [])
+            deal_partner = deal.get("partner_name") or deal.get("partner_long_name") or ""
+            norm_details = _norm_details(raw_details, has_account_name=True)
+            _update_payable_lookup(norm_details, deal_partner)
             if not any(d.get("account_item_id") in bank_account_item_ids for d in raw_details):
                 continue
             deals_hit += 1
-            all_entries.append({
+            bank_entries.append({
                 "issue_date":   deal.get("issue_date", ""),
-                "partner_name": deal.get("partner_name") or deal.get("partner_long_name") or "",
-                "details":      _norm_details(raw_details, has_account_name=True),
+                "partner_name": deal_partner,
+                "details":      norm_details,
             })
     except Exception as e:
         st.warning(f"deals取得エラー ({start_date}〜{end_date}): {e}")
@@ -265,35 +315,56 @@ def get_all_transactions(token, company_id, bank_account_item_ids, start_date, e
         manuals = _paginate("/manual_journals", "manual_journals", token, company_id, params)
         mj_raw = len(manuals)
         for mj in manuals:
-            raw_details = mj.get("details", [])
+            raw_details  = mj.get("details", [])
+            norm_details = _norm_details(raw_details, has_account_name=False)
+            _update_payable_lookup(norm_details)
             if not any(d.get("account_item_id") in bank_account_item_ids for d in raw_details):
                 continue
             mj_hit += 1
-            all_entries.append({
+            bank_entries.append({
                 "issue_date":   mj.get("issue_date", ""),
                 "partner_name": "",
-                "details":      _norm_details(raw_details, has_account_name=False),
+                "details":      norm_details,
             })
     except Exception as e:
         st.warning(f"manual_journals取得エラー ({start_date}〜{end_date}): {e}")
 
     if debug:
-        st.caption(f"　deals: API {deals_raw}件 → 銀行含む {deals_hit}件 ／ "
-                   f"manual_journals: API {mj_raw}件 → 銀行含む {mj_hit}件"
-                   + (f" ⚠ pagination上限到達の可能性" if mj_raw % 100 == 0 and mj_raw > 0 else ""))
+        st.caption(f"　deals: {deals_raw}件 → 銀行含む {deals_hit}件 ／ "
+                   f"manual_journals: {mj_raw}件 → 銀行含む {mj_hit}件 ／ "
+                   f"payable_lookup: {len(payable_lookup)}件")
+        if payable_lookup:
+            st.caption(f"　payable_lookup例: { {k: v for k, v in list(payable_lookup.items())[:5]} }")
 
-    return all_entries
+    return bank_entries, payable_lookup
 
-def get_walletable_balance(token, company_id, walletable_id, target_date):
-    try:
-        d = freee_get("/reports/walletable_balance", token, company_id, {
-            "walletable_type": "bank_account",
-            "walletable_id":   walletable_id,
-            "date":            target_date,
-        })
-        return d.get("walletable_balance", {}).get("balance", 0) or 0
-    except:
-        return 0
+def get_trial_bs_balances(token, company_id, bank_account_item_ids, year, month):
+    """trial_bs から月初・月末残高を取得。fiscal_year を year / year-1 の順で試みる。
+    Returns: (opening_balance, closing_balance) or (None, None)"""
+    for fy in [year, year - 1]:
+        try:
+            d = freee_get("/reports/trial_bs", token, company_id, {
+                "fiscal_year":               fy,
+                "start_month":               month,
+                "end_month":                 month,
+                "account_item_display_type": "account_item",
+            })
+            balances = (d.get("trial_bs") or {}).get("balances", [])
+            if not balances:
+                continue
+            opening = closing = 0
+            found = False
+            for b in balances:
+                aid = b.get("account_item_id")
+                if aid in bank_account_item_ids:
+                    opening += b.get("opening_balance", 0) or 0
+                    closing += b.get("closing_balance", 0) or 0
+                    found = True
+            if found:
+                return opening, closing
+        except Exception:
+            continue
+    return None, None
 
 # ============================================================
 # 仕訳から銀行が動いた行を抽出
@@ -446,7 +517,24 @@ ACCOUNT_MAP = {
     "仮受金":         "_要遡及",
 }
 
-def classify_row(row, skip_lookup=False):
+def _classify_account_name(account_name, partner="", amount=0):
+    """科目名からCFカテゴリを返す（payable_lookup 解決後に使用）"""
+    if account_name.startswith("仕入高"):
+        return "原価"
+    if account_name.startswith("売上高"):
+        return "売上の入金"
+    cat = ACCOUNT_MAP.get(account_name)
+    if cat == "_借入":
+        return "借入による収入" if amount > 0 else "借入の返済"
+    if cat == "_貸付":
+        return "貸付の回収" if amount > 0 else "貸付による支出"
+    if cat == "_外注":
+        return "人件費" if is_personal_name(partner) else "販管費"
+    if cat and not cat.startswith("_"):
+        return cat
+    return "販管費"
+
+def classify_row(row, skip_lookup=False, payable_lookup=None):
     account = row.get("account", "")
     partner = row.get("partner", "")
     amount  = row.get("amount", 0)
@@ -464,6 +552,11 @@ def classify_row(row, skip_lookup=False):
     if cat == "_外注":
         return "人件費" if is_personal_name(partner) else "販管費"
     if cat == "_要遡及":
+        # payable_lookup で partner → expense_account を解決
+        if payable_lookup and partner:
+            exp_acct = payable_lookup.get(partner)
+            if exp_acct:
+                return _classify_account_name(exp_acct, partner, amount)
         return None if not skip_lookup else "販管費"
     if cat:
         return cat
@@ -486,7 +579,7 @@ def get_past_category(partner, lookup_rows):
     cache[partner] = "販管費"
     return "販管費"
 
-def aggregate_cf(rows, lookup_rows):
+def aggregate_cf(rows, lookup_rows, payable_lookup=None):
     cats = {
         "売上の入金": 0, "原価": 0, "広告宣伝費": 0, "販管費": 0,
         "人件費": 0, "税金": 0, "借入による収入": 0, "貸付の回収": 0,
@@ -495,7 +588,7 @@ def aggregate_cf(rows, lookup_rows):
     unclassified = []
 
     for row in rows:
-        cat = classify_row(row)
+        cat = classify_row(row, payable_lookup=payable_lookup)
         if cat is None:
             cat = get_past_category(row.get("partner", ""), lookup_rows)
             row["_resolved"] = cat
@@ -892,36 +985,32 @@ if generate_btn:
         progress.progress(pct, text=f"{mon['year']}年{mon['month']}月 取引取得中...")
 
         try:
-            entries  = get_all_transactions(token, company_id, bank_account_item_ids,
-                                            s_date, e_date, acct_map, debug=debug_mode)
+            entries, payable_lookup = get_all_transactions(
+                token, company_id, bank_account_item_ids,
+                s_date, e_date, acct_map, debug=debug_mode)
             all_rows = extract_bank_lines(entries, bank_account_item_ids)
             if debug_mode:
-                st.info(f"{mon['year']}年{mon['month']}月: entries={len(entries)}, rows={len(all_rows)}")
+                st.info(f"{mon['year']}年{mon['month']}月: entries={len(entries)}, rows={len(all_rows)}, "
+                        f"payable_lookup={len(payable_lookup)}件")
             progress.progress(pct + 5, text=f"{mon['year']}年{mon['month']}月 分類中...")
-            # 未払金等の遡及は all_rows_pool（過去月の取得済み行）から検索（APIコールなし）
-            agg = aggregate_cf(all_rows, all_rows_pool)
-            all_rows_pool.extend(all_rows)  # 今月分をプールに追加
+            agg = aggregate_cf(all_rows, all_rows_pool, payable_lookup=payable_lookup)
+            all_rows_pool.extend(all_rows)
         except Exception as e:
-            st.warning(f"{mon['year']}年{mon['month']}月: {e}")
+            st.warning(f"{mon['year']}年{mon['month']}月 取得エラー: {e}")
             cf_data[key] = {"openingBalance": 0, "closingBalance": 0, "netCF": 0}
             verify_data[key] = 0
             continue
 
-        closing = sum(
-            get_walletable_balance(token, company_id, b["id"], e_date)
-            for b in bank_accounts
-        )
+        # trial_bs から残高を取得（walletable_balance API は使わない）
+        opening, closing = get_trial_bs_balances(
+            token, company_id, bank_account_item_ids, mon["year"], mon["month"])
+        if opening is None:
+            st.warning(f"{mon['year']}年{mon['month']}月: trial_bs から残高を取得できませんでした")
+            opening = closing = 0
+        agg["openingBalance"] = opening
         agg["closingBalance"] = closing
-        agg["openingBalance"] = 0
         cf_data[key]     = agg
         verify_data[key] = closing
-
-    # 月初残高を連鎖
-    for i in range(1, len(months)):
-        pk = str(months[i-1]["year"]) + "-" + str(months[i-1]["month"])
-        ck = str(months[i]["year"])   + "-" + str(months[i]["month"])
-        if pk in cf_data and ck in cf_data:
-            cf_data[ck]["openingBalance"] = cf_data[pk]["closingBalance"]
 
     progress.progress(95, text="HTML生成中...")
     html = generate_html(cf_data, selected_name, months, bank_names, verify_data)
