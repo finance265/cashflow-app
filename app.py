@@ -13,12 +13,19 @@ FREEE_BASE = "https://api.freee.co.jp/api/1"
 TOKEN_URL  = "https://accounts.secure.freee.co.jp/public_api/token"
 
 # ============================================================
-# トークン自動更新
+# トークン自動更新（永続ストレージ使用）
 # ============================================================
+async def save_tokens(access_token, refresh_token):
+    try:
+        await window.storage.set("freee_access_token", access_token)
+        await window.storage.set("freee_refresh_token", refresh_token)
+    except:
+        pass
+
 def refresh_access_token():
     """
-    Streamlit CloudのSecretsからリフレッシュトークンを使って
-    アクセストークンを自動更新する
+    Secretsのリフレッシュトークンで新しいアクセストークンを取得
+    新しいリフレッシュトークンもSecretsに自動保存
     """
     client_id     = st.secrets.get("FREEE_CLIENT_ID", "")
     client_secret = st.secrets.get("FREEE_CLIENT_SECRET", "")
@@ -36,9 +43,15 @@ def refresh_access_token():
         }, timeout=10)
         res.raise_for_status()
         data = res.json()
-        return data.get("access_token")
+        new_access  = data.get("access_token")
+        new_refresh = data.get("refresh_token")
+
+        # 新しいリフレッシュトークンをセッションに保存
+        if new_refresh:
+            st.session_state["latest_refresh_token"] = new_refresh
+
+        return new_access
     except Exception as e:
-        st.warning(f"トークン自動更新エラー: {e}")
         return None
 
 # ============================================================
@@ -619,20 +632,22 @@ def generate_html(cf_data, company_name, months, bank_names, verify_data):
 with st.sidebar:
     st.header("⚙️ 設定")
 
-    # リフレッシュトークンで自動更新を試みる
-    saved_token = st.secrets.get("FREEE_TOKEN", "")
-    auto_token  = None
-
+    auto_token = None
     if st.secrets.get("FREEE_REFRESH_TOKEN"):
         auto_token = refresh_access_token()
 
     if auto_token:
         st.success("✅ トークン自動更新済み")
         token = auto_token
-    elif saved_token:
+        # 新しいリフレッシュトークンが発行された場合は表示
+        new_rt = st.session_state.get("latest_refresh_token")
+        if new_rt and new_rt != st.secrets.get("FREEE_REFRESH_TOKEN"):
+            st.warning("⚠️ リフレッシュトークンが更新されました")
+            with st.expander("新しいリフレッシュトークン（Secretsを更新してください）"):
+                st.code(f'FREEE_REFRESH_TOKEN = "{new_rt}"')
+    elif st.secrets.get("FREEE_TOKEN"):
         st.success("✅ トークン読み込み済み")
-        use_saved = st.checkbox("保存済みトークンを使用", value=True)
-        token = saved_token if use_saved else st.text_input("freee アクセストークン", type="password")
+        token = st.secrets.get("FREEE_TOKEN")
     else:
         token = st.text_input("freee アクセストークン", type="password", placeholder="トークンを入力")
 
