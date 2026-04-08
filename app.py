@@ -816,6 +816,7 @@ if st.session_state.get("html_result"):
         mime="text/html",
         use_container_width=True,
         type="primary",
+        on_click=lambda: None,  # ページリセット防止
     )
 
     if debug_mode:
