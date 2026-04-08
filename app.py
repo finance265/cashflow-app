@@ -21,18 +21,14 @@ def freee_get(path, token, company_id, params=None):
     res = requests.get(
         f"{FREEE_BASE}{path}",
         headers={"Authorization": f"Bearer {token}"},
-        params=p,
-        timeout=30,
+        params=p, timeout=30,
     )
     res.raise_for_status()
     return res.json()
 
 def get_companies(token):
-    res = requests.get(
-        f"{FREEE_BASE}/companies",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=10,
-    )
+    res = requests.get(f"{FREEE_BASE}/companies",
+                       headers={"Authorization": f"Bearer {token}"}, timeout=10)
     res.raise_for_status()
     return res.json().get("companies", [])
 
@@ -40,41 +36,62 @@ def get_bank_walletables(token, company_id):
     d = freee_get("/walletables", token, company_id)
     return [w for w in d.get("walletables", []) if w.get("type") == "bank_account"]
 
-def get_account_items(token, company_id):
-    """全勘定科目を取得してname→idのマップを返す"""
-    d = freee_get("/account_items", token, company_id)
-    items = d.get("account_items", [])
-    return {i["name"]: i["id"] for i in items}, {i["id"]: i["name"] for i in items}
+def get_account_item_id_from_ledger(token, company_id, bank_names, start_date, end_date):
+    """
+    general_ledgersから銀行口座名に対応するaccount_item_idを取得
+    """
+    d = freee_get("/reports/general_ledgers", token, company_id, {
+        "start_date": start_date,
+        "end_date":   end_date,
+    })
+    rows = d.get("general_ledgers", [])
+    result = {}
+    for row in rows:
+        if row["account_item_name"] in bank_names:
+            result[row["account_item_name"]] = row["account_item_id"]
+    return result
 
-def get_journals_by_account(token, company_id, account_item_id, start_date, end_date):
+def get_deals_by_account(token, company_id, account_item_id, start_date, end_date):
     """
-    general_ledgers APIで特定勘定科目の仕訳明細を全件取得
+    deals APIをaccount_item_idで絞り込んで取得
     """
-    all_rows = []
-    offset   = 0
+    all_deals = []
+    offset = 0
     while True:
-        d = freee_get("/reports/general_ledgers", token, company_id, {
-            "account_item_id": account_item_id,
-            "start_date":      start_date,
-            "end_date":        end_date,
-            "offset":          offset,
-            "limit":           100,
+        d = freee_get("/deals", token, company_id, {
+            "account_item_id":  account_item_id,
+            "start_issue_date": start_date,
+            "end_issue_date":   end_date,
+            "offset":           offset,
+            "limit":            100,
         })
-        # デバッグ用に最初のレスポンスを保存
-        if offset == 0 and account_item_id not in st.session_state.get("journal_samples", {}):
-            st.session_state.setdefault("journal_samples", {})[account_item_id] = d
-
-        # general_ledgers APIのレスポンス構造に対応
-        rows = (
-            d.get("account_item", {}).get("balances") or
-            d.get("balances") or
-            []
-        )
-        all_rows.extend(rows)
-        if len(rows) < 100:
+        deals = d.get("deals", [])
+        all_deals.extend(deals)
+        if len(deals) < 100:
             break
         offset += 100
-    return all_rows
+    return all_deals
+
+def get_manual_journals_by_account(token, company_id, account_item_id, start_date, end_date):
+    """
+    manual_journals APIをaccount_item_idで絞り込んで取得
+    """
+    all_journals = []
+    offset = 0
+    while True:
+        d = freee_get("/manual_journals", token, company_id, {
+            "account_item_id":  account_item_id,
+            "start_issue_date": start_date,
+            "end_issue_date":   end_date,
+            "offset":           offset,
+            "limit":            100,
+        })
+        journals = d.get("manual_journals", [])
+        all_journals.extend(journals)
+        if len(journals) < 100:
+            break
+        offset += 100
+    return all_journals
 
 def get_walletable_balance(token, company_id, walletable_id, target_date):
     try:
@@ -90,38 +107,75 @@ def get_walletable_balance(token, company_id, walletable_id, target_date):
 # ============================================================
 # 仕訳からCF行を抽出
 # ============================================================
-def extract_cf_line(row, bank_account_item_ids, id_to_name):
+def extract_from_deal(deal, bank_account_item_ids):
     """
-    general_ledgers の1行から CF行に変換
-    rowの構造: {
-      date, debit_amount, credit_amount, description,
-      partner_name, counter_account_name, counter_account_id, ...
-    }
+    取引（deal）から銀行が動いた行を抽出してCF行リストに変換
     """
     results = []
-    debit  = row.get("debit_amount", 0) or 0
-    credit = row.get("credit_amount", 0) or 0
+    issue_date   = deal.get("issue_date", "")
+    partner_name = deal.get("partner_name") or ""
+    details      = deal.get("details", [])
 
-    if debit == 0 and credit == 0:
-        return results
+    bank_lines  = [d for d in details if d.get("account_item_id") in bank_account_item_ids]
+    other_lines = [d for d in details if d.get("account_item_id") not in bank_account_item_ids]
 
-    # 預金の借方=入金, 貸方=出金
-    net = debit - credit
+    for bl in bank_lines:
+        entry_side = bl.get("entry_side", "")
+        amount     = bl.get("amount", 0) or 0
+        net        = amount if entry_side == "debit" else -amount
 
-    counter_account = (
-        row.get("counter_account_name") or
-        id_to_name.get(row.get("counter_account_item_id", 0), "") or
-        ""
-    )
-    partner = row.get("partner_name") or ""
+        # 相手科目・取引先を特定
+        counter_account = ""
+        counter_partner = bl.get("partner_name") or partner_name
+        if other_lines:
+            # 金額が最大の相手行を採用
+            best = max(other_lines, key=lambda x: x.get("amount", 0))
+            counter_account = best.get("account_item_name") or ""
+            if best.get("partner_name"):
+                counter_partner = best.get("partner_name")
 
-    results.append({
-        "date":        row.get("date", ""),
-        "amount":      net,
-        "partner":     partner,
-        "account":     counter_account,
-        "description": row.get("description") or row.get("memo") or "",
-    })
+        results.append({
+            "date":        issue_date,
+            "amount":      net,
+            "partner":     counter_partner,
+            "account":     counter_account,
+            "description": deal.get("description") or "",
+            "source":      "deal",
+        })
+    return results
+
+def extract_from_manual_journal(journal, bank_account_item_ids):
+    """
+    振替伝票（manual_journal）から銀行が動いた行を抽出してCF行リストに変換
+    """
+    results = []
+    issue_date = journal.get("issue_date", "")
+    details    = journal.get("details", [])
+
+    bank_lines  = [d for d in details if d.get("account_item_id") in bank_account_item_ids]
+    other_lines = [d for d in details if d.get("account_item_id") not in bank_account_item_ids]
+
+    for bl in bank_lines:
+        entry_side = bl.get("entry_side", "")
+        amount     = bl.get("amount", 0) or 0
+        net        = amount if entry_side == "debit" else -amount
+
+        counter_account = ""
+        counter_partner = bl.get("partner_name") or ""
+        if other_lines:
+            best = max(other_lines, key=lambda x: x.get("amount", 0))
+            counter_account = best.get("account_item_name") or ""
+            if best.get("partner_name") and not counter_partner:
+                counter_partner = best.get("partner_name")
+
+        results.append({
+            "date":        issue_date,
+            "amount":      net,
+            "partner":     counter_partner,
+            "account":     counter_account,
+            "description": bl.get("description") or journal.get("description") or "",
+            "source":      "manual_journal",
+        })
     return results
 
 # ============================================================
@@ -147,14 +201,21 @@ def is_personal_name(name):
         return True
     return False
 
-ACCOUNT_CATEGORY_MAP = {
+# 相手科目名 → CF区分
+ACCOUNT_MAP = {
+    # 売上の入金
     "売掛金":         "売上の入金",
     "前受金":         "売上の入金",
     "未収入金":       "売上の入金",
     "未収利息":       "売上の入金",
     "受取利息":       "売上の入金",
     "雑収入":         "売上の入金",
+    "預り金":         "売上の入金",
+    # 原価（前方一致で判定）
+    # → classify_row内でstartswith("仕入高")で処理
+    # 広告宣伝費
     "広告宣伝費":     "広告宣伝費",
+    # 人件費
     "役員報酬":       "人件費",
     "給与手当":       "人件費",
     "給与":           "人件費",
@@ -162,19 +223,27 @@ ACCOUNT_CATEGORY_MAP = {
     "法定福利費":     "人件費",
     "社会保険料":     "人件費",
     "労働保険料":     "人件費",
+    # 税金
     "法人税等":       "税金",
     "租税公課":       "税金",
     "源泉所得税":     "税金",
+    # 借入
     "長期借入金":     "_借入",
     "短期借入金":     "_借入",
+    # 支払利息
     "支払利息":       "借入の返済",
+    "未払利息":       "借入の返済",
     "長期未払金":     "借入の返済",
+    # 貸付
     "長期貸付金":     "_貸付",
     "短期貸付金":     "_貸付",
+    # 外注（個人名判定が必要）
     "外注費":         "_外注",
     "業務委託費":     "_外注",
+    # 販管費
     "顧問料":         "販管費",
     "採用教育費":     "販管費",
+    "研修費":         "販管費",
     "交際費":         "販管費",
     "会議費":         "販管費",
     "旅費交通費":     "販管費",
@@ -195,10 +264,8 @@ ACCOUNT_CATEGORY_MAP = {
     "車両費":         "販管費",
     "修繕費":         "販管費",
     "寄付金":         "販管費",
-    "減価償却費":     "販管費",
     "差入保証金":     "販管費",
-    "敷金":           "販管費",
-    # 要遡及
+    # 要遡及（未払金系）
     "未払金":         "_要遡及",
     "未払費用":       "_要遡及",
     "BD興行未払金":   "_要遡及",
@@ -215,12 +282,14 @@ def classify_row(row, skip_lookup=False):
     partner = row.get("partner", "")
     amount  = row.get("amount", 0)
 
+    # 仕入高系（前方一致）
     if account.startswith("仕入高"):
         return "原価"
+    # 売上高系が直接相手科目になる場合
     if account.startswith("売上高"):
         return "売上の入金"
 
-    cat = ACCOUNT_CATEGORY_MAP.get(account)
+    cat = ACCOUNT_MAP.get(account)
 
     if cat == "_借入":
         return "借入による収入" if amount > 0 else "借入の返済"
@@ -233,41 +302,42 @@ def classify_row(row, skip_lookup=False):
     if cat:
         return cat
 
+    # マップにない科目
     return "売上の入金" if amount > 0 else "販管費"
 
-# 取引先ごとの過去分類キャッシュ
-_partner_cache = {}
-
-def get_past_category(token, company_id, bank_account_item_ids, id_to_name, partner, before_date):
+# 取引先ごとの過去分類キャッシュ（セッション内で保持）
+def get_past_category(token, company_id, bank_account_item_ids, partner, before_date):
     if not partner:
         return "販管費"
-    if partner in _partner_cache:
-        return _partner_cache[partner]
+
+    cache = st.session_state.setdefault("partner_cache", {})
+    if partner in cache:
+        return cache[partner]
 
     end_dt   = date.fromisoformat(before_date) - timedelta(days=1)
     start_dt = end_dt - timedelta(days=90)
 
     try:
-        for acct_id in list(bank_account_item_ids)[:1]:  # 1口座で十分
-            rows = get_journals_by_account(
+        for acct_id in list(bank_account_item_ids)[:2]:
+            deals = get_deals_by_account(
                 token, company_id, acct_id,
                 start_dt.isoformat(), end_dt.isoformat()
             )
-            for entry in rows:
-                cf_lines = extract_cf_line(entry, bank_account_item_ids, id_to_name)
-                for line in cf_lines:
+            for deal in deals:
+                lines = extract_from_deal(deal, bank_account_item_ids)
+                for line in lines:
                     if line.get("partner") == partner:
                         cat = classify_row(line, skip_lookup=True)
                         if cat:
-                            _partner_cache[partner] = cat
+                            cache[partner] = cat
                             return cat
     except:
         pass
 
-    _partner_cache[partner] = "販管費"
+    cache[partner] = "販管費"
     return "販管費"
 
-def aggregate_cf(all_lines, token, company_id, bank_account_item_ids, id_to_name, start_date):
+def aggregate_cf(rows, token, company_id, bank_account_item_ids, start_date):
     cats = {
         "売上の入金": 0, "原価": 0, "広告宣伝費": 0, "販管費": 0,
         "人件費": 0, "税金": 0, "借入による収入": 0, "貸付の回収": 0,
@@ -275,11 +345,12 @@ def aggregate_cf(all_lines, token, company_id, bank_account_item_ids, id_to_name
     }
     unclassified = []
 
-    for row in all_lines:
+    for row in rows:
         cat = classify_row(row)
         if cat is None:
+            # 過去仕訳を遡って分類
             cat = get_past_category(
-                token, company_id, bank_account_item_ids, id_to_name,
+                token, company_id, bank_account_item_ids,
                 row.get("partner", ""), start_date
             )
             row["_resolved"] = cat
@@ -300,7 +371,7 @@ def aggregate_cf(all_lines, token, company_id, bank_account_item_ids, id_to_name
         "財務収入計": 財務収入計, "財務支出計": 財務支出計,
         "財務収支": 財務収支, "netCF": netCF,
         "_unclassified": unclassified,
-        "_all_lines": all_lines,
+        "_all_rows": rows,
     }
 
 # ============================================================
@@ -331,14 +402,12 @@ def generate_html(cf_data, company_name, months, bank_names, verify_data):
     def cells(key):
         return "".join(
             '<td class="num">' + fmt(cf_data.get(mk(m), {}).get(key, 0)) + '</td>'
-            for m in months
-        )
+            for m in months)
 
     def bal_cells(key):
         return "".join(
             '<td class="num bg-bal">' + fmt_num(cf_data.get(mk(m), {}).get(key, 0)) + '</td>'
-            for m in months
-        )
+            for m in months)
 
     def total_cells(key):
         parts = []
@@ -366,15 +435,13 @@ def generate_html(cf_data, company_name, months, bank_names, verify_data):
 
     vf = "".join(
         '<td class="num bg-vrf">' + fmt_num(verify_data.get(mk(m), 0)) + '</td>'
-        for m in months
-    )
+        for m in months)
     vd = "".join(
         '<td class="num bg-vrf">' + fmt_diff(
             (cf_data.get(mk(m), {}).get("closingBalance", 0) or 0) -
             (verify_data.get(mk(m), 0) or 0)
         ) + '</td>'
-        for m in months
-    )
+        for m in months)
     col_headers = "".join(f"<th>{m['year']}年{m['month']}月</th>" for m in months)
 
     return f"""<!DOCTYPE html>
@@ -507,9 +574,9 @@ def generate_html(cf_data, company_name, months, bank_names, verify_data):
   </table>
   </div>
   <div class="footnote">
-    ※ 仕訳帳（journals）から預金科目が含まれる仕訳を抽出して集計しています。<br>
+    ※ 取引（deals）・振替伝票（manual_journals）から銀行口座が動いた仕訳を抽出して集計しています。<br>
     ※ 外注費・業務委託費は取引先名で個人名判定し、個人名の場合は人件費に分類しています。<br>
-    ※ 未払金等で相手科目不明の場合は同取引先の過去3ヶ月の仕訳を参照して分類しています。<br>
+    ※ 未払金等で分類不明の場合は同取引先の過去3ヶ月仕訳を参照して分類しています。<br>
     ※ 出力日: {today}
   </div>
 </div>
@@ -566,7 +633,7 @@ if "html_result" not in st.session_state:
     st.session_state["html_result"] = None
 
 if generate_btn:
-    _partner_cache.clear()
+    st.session_state["partner_cache"] = {}  # キャッシュリセット
     months = []
     cy, cm = start_year, start_month
     while (cy, cm) <= (end_year, end_month):
@@ -575,7 +642,7 @@ if generate_btn:
         if cm > 12:
             cm = 1; cy += 1
 
-    progress = st.progress(0, text="準備中...")
+    progress = st.progress(0, text="銀行口座を取得中...")
 
     # 銀行口座取得
     try:
@@ -588,38 +655,32 @@ if generate_btn:
         st.error("銀行口座が見つかりません")
         st.stop()
 
-    # 勘定科目マップ取得
-    progress.progress(5, text="勘定科目を取得中...")
+    bank_names = [b["name"] for b in bank_accounts]
+
+    # general_ledgersからaccount_item_idを取得
+    progress.progress(5, text="勘定科目IDを取得中...")
+    first_mon  = months[0]
+    last_mon   = months[-1]
+    last_day_f = monthrange(first_mon["year"], first_mon["month"])[1]
+    s_date_f   = f"{first_mon['year']}-{first_mon['month']:02d}-01"
+    e_date_f   = f"{last_mon['year']}-{last_mon['month']:02d}-{monthrange(last_mon['year'], last_mon['month'])[1]}"
+
     try:
-        name_to_id, id_to_name = get_account_items(token, company_id)
+        bank_id_map = get_account_item_id_from_ledger(
+            token, company_id, bank_names, s_date_f, e_date_f
+        )
     except Exception as e:
-        st.error(f"勘定科目取得エラー: {e}")
+        st.error(f"勘定科目ID取得エラー: {e}")
         st.stop()
 
-    # 銀行口座の account_item_id を特定
-    bank_account_item_ids = set()
-    bank_names = []
-    for b in bank_accounts:
-        bname = b["name"]
-        bank_names.append(bname)
-        if bname in name_to_id:
-            bank_account_item_ids.add(name_to_id[bname])
-        if b.get("account_item_id"):
-            bank_account_item_ids.add(b["account_item_id"])
+    if not bank_id_map:
+        st.error("銀行口座の勘定科目IDが取得できませんでした")
+        st.stop()
+
+    bank_account_item_ids = set(bank_id_map.values())
 
     if debug_mode:
-        st.info(f"銀行口座: {bank_names}")
-        st.info(f"account_item_ids: {bank_account_item_ids}")
-
-    if not bank_account_item_ids:
-        st.error("銀行口座の勘定科目IDが特定できません。デバッグモードで確認してください。")
-        # デバッグ用に全勘定科目を表示
-        with st.expander("全勘定科目一覧"):
-            import pandas as pd
-            st.dataframe(pd.DataFrame([
-                {"name": k, "id": v} for k, v in name_to_id.items()
-            ]), use_container_width=True)
-        st.stop()
+        st.info(f"銀行口座IDマップ: {bank_id_map}")
 
     cf_data     = {}
     verify_data = {}
@@ -631,21 +692,26 @@ if generate_btn:
         e_date   = f"{mon['year']}-{mon['month']:02d}-{last_day}"
         pct      = int(10 + (i / len(months)) * 70)
 
-        all_lines = []
+        all_rows = []
 
-        for acct_id in bank_account_item_ids:
-            acct_name = id_to_name.get(acct_id, str(acct_id))
-            progress.progress(pct, text=f"{mon['year']}年{mon['month']}月 / {acct_name} 取得中...")
+        for bank_name, acct_id in bank_id_map.items():
+            progress.progress(pct, text=f"{mon['year']}年{mon['month']}月 / {bank_name} 取引取得中...")
             try:
-                entries = get_journals_by_account(token, company_id, acct_id, s_date, e_date)
-                for entry in entries:
-                    lines = extract_cf_line(entry, bank_account_item_ids, id_to_name)
-                    all_lines.extend(lines)
+                deals = get_deals_by_account(token, company_id, acct_id, s_date, e_date)
+                for deal in deals:
+                    all_rows.extend(extract_from_deal(deal, bank_account_item_ids))
             except Exception as e:
-                st.warning(f"{acct_name}: {e}")
+                st.warning(f"deals {bank_name}: {e}")
+
+            try:
+                journals = get_manual_journals_by_account(token, company_id, acct_id, s_date, e_date)
+                for journal in journals:
+                    all_rows.extend(extract_from_manual_journal(journal, bank_account_item_ids))
+            except Exception as e:
+                st.warning(f"manual_journals {bank_name}: {e}")
 
         progress.progress(pct + 5, text=f"{mon['year']}年{mon['month']}月 分類中...")
-        agg = aggregate_cf(all_lines, token, company_id, bank_account_item_ids, id_to_name, s_date)
+        agg = aggregate_cf(all_rows, token, company_id, bank_account_item_ids, s_date)
 
         # 月末残高
         closing = sum(
@@ -694,7 +760,7 @@ if st.session_state.get("html_result"):
         cb  = cf_data.get(key, {}).get("closingBalance", 0) or 0
         fb  = verify_data.get(key, 0) or 0
         if abs(cb - fb) > 0 and fb > 0:
-            st.warning(f"⚠ {mon['year']}年{mon['month']}月: 差異 {cb - fb:,}円")
+            st.warning(f"⚠ {mon['year']}年{mon['month']}月: freee残高との差異 {cb - fb:,}円")
             has_diff = True
     if not has_diff:
         st.info("✅ 全月、freee残高との差異なし")
@@ -713,20 +779,14 @@ if st.session_state.get("html_result"):
     )
 
     if debug_mode:
-        # journals APIのサンプルレスポンスを表示
-        if st.session_state.get("journal_samples"):
-            for acct_id, sample in st.session_state["journal_samples"].items():
-                with st.expander(f"📦 journals APIレスポンス（account_item_id={acct_id}）"):
-                    st.json(sample)
-
         for mon in months:
             key = str(mon["year"]) + "-" + str(mon["month"])
             d   = cf_data.get(key, {})
-            lines = d.get("_all_lines", [])
-            if lines:
-                with st.expander(f"📋 {mon['year']}年{mon['month']}月 CF行一覧（{len(lines)}件）"):
+            rows = d.get("_all_rows", [])
+            if rows:
+                with st.expander(f"📋 {mon['year']}年{mon['month']}月 仕訳明細（{len(rows)}件）"):
                     import pandas as pd
-                    st.dataframe(pd.DataFrame(lines), use_container_width=True)
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
             uncl = d.get("_unclassified", [])
             if uncl:
                 with st.expander(f"⚠ {mon['year']}年{mon['month']}月 遡及処理した仕訳（{len(uncl)}件）"):
