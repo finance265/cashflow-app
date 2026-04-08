@@ -76,33 +76,26 @@ def get_bank_account_item_ids(token, company_id, bank_names, start_date, end_dat
             for r in rows if r["account_item_name"] in bank_names}
 
 def get_journals(token, company_id, start_date, end_date):
-    """
-    仕訳帳APIで期間内の全仕訳を取得
-    freee journals APIはdownload_token方式を使用
-    """
     all_journals = []
-
-    # まずダウンロードトークンを取得
     start = date.fromisoformat(start_date)
     end   = date.fromisoformat(end_date)
+    err1  = None
 
     # 方式1: fiscal_year + start_month/end_month
     try:
         d = freee_get("/journals", token, company_id, {
-            "fiscal_year":  start.year,
-            "start_month":  start.month,
-            "end_month":    end.month,
-            "visible_tags": ["all"],
-            "offset":       0,
-            "limit":        100,
+            "fiscal_year": start.year,
+            "start_month": start.month,
+            "end_month":   end.month,
+            "offset":      0,
+            "limit":       100,
         })
-        if offset == 0:
-            st.session_state["_journal_sample"] = d
+        st.session_state["_journal_sample"] = d
         items = d.get("journals", []) or d.get("rows", [])
         all_journals.extend(items)
         return all_journals
-    except Exception as e1:
-        pass
+    except Exception as e:
+        err1 = str(e)
 
     # 方式2: start_issue_date/end_issue_date
     try:
@@ -122,8 +115,8 @@ def get_journals(token, company_id, start_date, end_date):
                 break
             offset += 100
         return all_journals
-    except Exception as e2:
-        raise Exception(f"journals API失敗: {e1} / {e2}")
+    except Exception as e:
+        raise Exception(f"journals API失敗: 方式1={err1} / 方式2={e}")
 
 def get_walletable_balance(token, company_id, walletable_id, target_date):
     try:
