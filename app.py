@@ -138,9 +138,14 @@ def refresh_access_token():
         if res.status_code != 200:
             err = data.get("error_description") or data.get("error") or res.text
             st.session_state["_token_error"] = f"HTTP {res.status_code}: {err}"
-            # 認証エラー(401/400)のときだけ stored_refresh_token を破棄
+            # 認証エラー(400/401)のときはセッションとファイル両方を破棄
             if res.status_code in (400, 401):
                 st.session_state.pop("stored_refresh_token", None)
+                st.session_state.pop("stored_access_token", None)
+                try:
+                    os.remove(TOKEN_FILE)
+                except FileNotFoundError:
+                    pass
             return None
         if data.get("refresh_token"):
             st.session_state["stored_refresh_token"] = data["refresh_token"]
@@ -731,6 +736,18 @@ with st.sidebar:
             token = st.text_input("freee アクセストークン", type="password",
                                   key="manual_token")
             st.caption("freee管理画面 → 連携アプリ → アクセストークンをコピー")
+
+    # 連携リセットボタン（エラー時に保存済みトークンをクリア）
+    if st.session_state.get("stored_refresh_token") or os.path.exists(TOKEN_FILE):
+        if st.button("🗑 保存済み連携をリセット", use_container_width=True):
+            st.session_state.pop("stored_refresh_token", None)
+            st.session_state.pop("stored_access_token", None)
+            st.session_state.pop("_token_error", None)
+            try:
+                os.remove(TOKEN_FILE)
+            except FileNotFoundError:
+                pass
+            st.rerun()
 
 if not token:
     st.info("👈 左のサイドバーにfreeeのアクセストークンを入力してください")
