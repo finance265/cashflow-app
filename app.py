@@ -202,7 +202,8 @@ def get_bank_account_item_ids_from_walletables(bank_accounts):
     return result
 
 def _paginate(path, key, token, company_id, params):
-    """ページネーション付きAPIを全件取得"""
+    """ページネーション付きAPIを全件取得。
+    freee APIによって total_count の場所が異なるため複数パスで探す。"""
     result = []
     offset = 0
     limit  = 100
@@ -210,9 +211,15 @@ def _paginate(path, key, token, company_id, params):
         d     = freee_get(path, token, company_id, {**params, "offset": offset, "limit": limit})
         items = d.get(key, [])
         result.extend(items)
-        total  = d.get("meta", {}).get("total_count", 0)
+        # total_count の場所: meta.total_count / total_count / meta.total_entries など
+        meta  = d.get("meta") or {}
+        total = (meta.get("total_count") or meta.get("total_entries")
+                 or d.get("total_count") or 0)
         offset += len(items)
-        if offset >= total or not items:
+        # total が取れない場合は items が limit 未満になるまで続ける
+        if total and offset >= total:
+            break
+        if len(items) < limit:
             break
     return result
 
@@ -272,7 +279,8 @@ def get_all_transactions(token, company_id, bank_account_item_ids, start_date, e
 
     if debug:
         st.caption(f"　deals: API {deals_raw}件 → 銀行含む {deals_hit}件 ／ "
-                   f"manual_journals: API {mj_raw}件 → 銀行含む {mj_hit}件")
+                   f"manual_journals: API {mj_raw}件 → 銀行含む {mj_hit}件"
+                   + (f" ⚠ pagination上限到達の可能性" if mj_raw % 100 == 0 and mj_raw > 0 else ""))
 
     return all_entries
 
