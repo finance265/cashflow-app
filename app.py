@@ -78,30 +78,52 @@ def get_bank_account_item_ids(token, company_id, bank_names, start_date, end_dat
 def get_journals(token, company_id, start_date, end_date):
     """
     仕訳帳APIで期間内の全仕訳を取得
+    freee journals APIはdownload_token方式を使用
     """
     all_journals = []
-    offset = 0
-    while True:
+
+    # まずダウンロードトークンを取得
+    start = date.fromisoformat(start_date)
+    end   = date.fromisoformat(end_date)
+
+    # 方式1: fiscal_year + start_month/end_month
+    try:
         d = freee_get("/journals", token, company_id, {
-            "start_date": start_date,
-            "end_date":   end_date,
-            "offset":     offset,
-            "limit":      100,
+            "fiscal_year":  start.year,
+            "start_month":  start.month,
+            "end_month":    end.month,
+            "visible_tags": ["all"],
+            "offset":       0,
+            "limit":        100,
         })
-        # デバッグ用に最初のレスポンスを保存
         if offset == 0:
             st.session_state["_journal_sample"] = d
-
-        journals = d.get("journals", [])
-        all_rows = d.get("rows", [])  # APIによってキーが異なる可能性
-
-        items = journals or all_rows
+        items = d.get("journals", []) or d.get("rows", [])
         all_journals.extend(items)
+        return all_journals
+    except Exception as e1:
+        pass
 
-        if len(items) < 100:
-            break
-        offset += 100
-    return all_journals
+    # 方式2: start_issue_date/end_issue_date
+    try:
+        offset = 0
+        while True:
+            d = freee_get("/journals", token, company_id, {
+                "start_issue_date": start_date,
+                "end_issue_date":   end_date,
+                "offset":           offset,
+                "limit":            100,
+            })
+            if offset == 0:
+                st.session_state["_journal_sample"] = d
+            items = d.get("journals", []) or d.get("rows", [])
+            all_journals.extend(items)
+            if len(items) < 100:
+                break
+            offset += 100
+        return all_journals
+    except Exception as e2:
+        raise Exception(f"journals API失敗: {e1} / {e2}")
 
 def get_walletable_balance(token, company_id, walletable_id, target_date):
     try:
