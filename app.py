@@ -5,6 +5,7 @@ import re
 import json
 import os
 import urllib.parse
+import pandas as pd
 from datetime import date, timedelta
 from calendar import monthrange
 
@@ -293,7 +294,7 @@ def get_all_transactions(token, company_id, bank_account_item_ids, start_date, e
         deals = _paginate("/deals", "deals", token, company_id, params)
         deals_raw = len(deals)
         for deal in deals:
-            raw_details  = deal.get("details", [])
+            raw_details  = deal.get("details") or []
             deal_partner = deal.get("partner_name") or deal.get("partner_long_name") or ""
             norm_details = _norm_details(raw_details, has_account_name=True)
             _update_payable_lookup(norm_details, deal_partner)
@@ -315,7 +316,7 @@ def get_all_transactions(token, company_id, bank_account_item_ids, start_date, e
         manuals = _paginate("/manual_journals", "manual_journals", token, company_id, params)
         mj_raw = len(manuals)
         for mj in manuals:
-            raw_details  = mj.get("details", [])
+            raw_details  = mj.get("details") or []
             norm_details = _norm_details(raw_details, has_account_name=False)
             _update_payable_lookup(norm_details)
             if not any(d.get("account_item_id") in bank_account_item_ids for d in raw_details):
@@ -937,7 +938,7 @@ if generate_btn:
     progress.progress(5, text="科目マスタ・口座IDを取得中...")
     bank_id_map = get_bank_account_item_ids_from_walletables(bank_accounts)
 
-    # walletables に account_item_id がない場合のフォールバック（既知ID / 株式会社BACKSTAGE）
+    # walletables に account_item_id がない場合のフォールバック（株式会社BACKSTAGE専用。他社では口座名が一致しないため発動しない）
     KNOWN_ACCT_IDS = {
         "みずほ銀行":           745334884,
         "きらぼし銀行":         745335730,
@@ -1048,7 +1049,6 @@ if st.session_state.get("html_result"):
             rows = cf_data.get(key, {}).get("_all_rows", [])
             uncl = cf_data.get(key, {}).get("_unclassified", [])
             if rows:
-                import pandas as pd
                 with st.expander(f"🔍 差異原因分析 — {mon['year']}年{mon['month']}月の全仕訳明細（{len(rows)}件）"):
                     df = pd.DataFrame(rows)[["date","account","partner","amount","description"]]
                     df.columns = ["日付","相手科目","取引先","金額","摘要"]
