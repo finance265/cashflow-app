@@ -41,6 +41,10 @@ def get_oauth_url() -> str:
 
 def exchange_code_for_tokens(code: str) -> dict:
     """認証コード → アクセストークン＋リフレッシュトークン"""
+    redirect_uri = (
+        st.session_state.get("_redirect_uri") or
+        st.secrets.get("REDIRECT_URI", "")
+    )
     res = requests.post(
         "https://accounts.secure.freee.co.jp/public_api/token",
         data={
@@ -48,7 +52,7 @@ def exchange_code_for_tokens(code: str) -> dict:
             "client_id":     st.secrets.get("FREEE_CLIENT_ID", ""),
             "client_secret": st.secrets.get("FREEE_CLIENT_SECRET", ""),
             "code":          code,
-            "redirect_uri":  st.secrets.get("REDIRECT_URI", ""),
+            "redirect_uri":  redirect_uri,
         },
         timeout=15,
     )
@@ -212,10 +216,9 @@ def _paginate(path, key, token, company_id, params):
             break
     return result
 
-def get_all_transactions(token, company_id, bank_account_item_ids, start_date, end_date, acct_map):
-    """deals + manual_journals を日付範囲で一括取得し、銀行口座が含まれる仕訳のみ返す。
-    manual_journalsのdetailsに account_item_name がないため acct_map で補完する。
-    deals の account_item_name も acct_map で補完（欠落する場合に備えて）。"""
+def get_all_transactions(token, company_id, bank_account_item_ids, start_date, end_date, acct_map,
+                         debug=False):
+    """deals + manual_journals を日付範囲で一括取得し、銀行口座が含まれる仕訳のみ返す。"""
     params      = {"start_issue_date": start_date, "end_issue_date": end_date}
     all_entries = []
 
@@ -229,35 +232,47 @@ def get_all_transactions(token, company_id, bank_account_item_ids, start_date, e
             out.append({**det, "account_item_name": name, "partner_name": pname})
         return out
 
-    # ---- deals（日付範囲で一括取得） ----
+    # ---- deals ----
+    deals_raw = 0
+    deals_hit = 0
     try:
         deals = _paginate("/deals", "deals", token, company_id, params)
+        deals_raw = len(deals)
         for deal in deals:
             raw_details = deal.get("details", [])
             if not any(d.get("account_item_id") in bank_account_item_ids for d in raw_details):
-                continue  # 銀行口座が含まれない → スキップ
+                continue
+            deals_hit += 1
             all_entries.append({
                 "issue_date":   deal.get("issue_date", ""),
                 "partner_name": deal.get("partner_name") or deal.get("partner_long_name") or "",
                 "details":      _norm_details(raw_details, has_account_name=True),
             })
     except Exception as e:
-        st.warning(f"deals取得エラー: {e}")
+        st.warning(f"deals取得エラー ({start_date}〜{end_date}): {e}")
 
-    # ---- manual_journals（日付範囲で一括取得） ----
+    # ---- manual_journals ----
+    mj_raw = 0
+    mj_hit = 0
     try:
         manuals = _paginate("/manual_journals", "manual_journals", token, company_id, params)
+        mj_raw = len(manuals)
         for mj in manuals:
             raw_details = mj.get("details", [])
             if not any(d.get("account_item_id") in bank_account_item_ids for d in raw_details):
-                continue  # 銀行口座が含まれない → スキップ
+                continue
+            mj_hit += 1
             all_entries.append({
                 "issue_date":   mj.get("issue_date", ""),
                 "partner_name": "",
                 "details":      _norm_details(raw_details, has_account_name=False),
             })
     except Exception as e:
-        st.warning(f"manual_journals取得エラー: {e}")
+        st.warning(f"manual_journals取得エラー ({start_date}〜{end_date}): {e}")
+
+    if debug:
+        st.caption(f"　deals: API {deals_raw}件 → 銀行含む {deals_hit}件 ／ "
+                   f"manual_journals: API {mj_raw}件 → 銀行含む {mj_hit}件")
 
     return all_entries
 
@@ -447,32 +462,23 @@ def classify_row(row, skip_lookup=False):
 
     return "売上の入金" if amount > 0 else "販管費"
 
-def get_past_category(token, company_id, bank_account_item_ids, partner, before_date):
+def get_past_category(partner, lookup_rows):
+    """APIコールなし：取得済み全仕訳から同取引先の過去行を検索してカテゴリを推定"""
     if not partner:
         return "販管費"
     cache = st.session_state.setdefault("partner_cache", {})
     if partner in cache:
         return cache[partner]
-
-    end_dt   = date.fromisoformat(before_date) - timedelta(days=1)
-    start_dt = end_dt - timedelta(days=90)
-    try:
-        past_entries = get_all_transactions(token, company_id, bank_account_item_ids,
-                                            start_dt.isoformat(), end_dt.isoformat(), {})
-        past_lines   = extract_bank_lines(past_entries, bank_account_item_ids)
-        for line in past_lines:
-            if line.get("partner") == partner:
-                cat = classify_row(line, skip_lookup=True)
-                if cat:
-                    cache[partner] = cat
-                    return cat
-    except:
-        pass
-
+    for line in lookup_rows:
+        if line.get("partner") == partner:
+            cat = classify_row(line, skip_lookup=True)
+            if cat:
+                cache[partner] = cat
+                return cat
     cache[partner] = "販管費"
     return "販管費"
 
-def aggregate_cf(rows, token, company_id, bank_account_item_ids, start_date):
+def aggregate_cf(rows, lookup_rows):
     cats = {
         "売上の入金": 0, "原価": 0, "広告宣伝費": 0, "販管費": 0,
         "人件費": 0, "税金": 0, "借入による収入": 0, "貸付の回収": 0,
@@ -483,10 +489,7 @@ def aggregate_cf(rows, token, company_id, bank_account_item_ids, start_date):
     for row in rows:
         cat = classify_row(row)
         if cat is None:
-            cat = get_past_category(
-                token, company_id, bank_account_item_ids,
-                row.get("partner", ""), start_date
-            )
+            cat = get_past_category(row.get("partner", ""), lookup_rows)
             row["_resolved"] = cat
             unclassified.append(row)
         cats[cat] += row.get("amount", 0)
@@ -723,15 +726,35 @@ with st.sidebar:
         err_msg = st.session_state.get("_token_error", "")
         if err_msg:
             st.warning(f"⚠ {err_msg}")
-        # OAuth 連携ボタン（client_id と redirect_uri が設定済みの場合のみ表示）
-        if st.secrets.get("FREEE_CLIENT_ID") and st.secrets.get("REDIRECT_URI"):
-            auth_url = get_oauth_url()
-            st.link_button("🔗 freeeと連携する", auth_url, use_container_width=True)
-            st.caption("クリックするとfreeeの認証画面に移動します。\n"
-                       "認証完了後このページに自動で戻ります。")
+        # OAuth 連携ボタン（FREEE_CLIENT_ID が設定済みの場合に表示）
+        if st.secrets.get("FREEE_CLIENT_ID"):
+            # REDIRECT_URI: Secrets優先、なければサイドバーで入力
+            redirect_uri = st.secrets.get("REDIRECT_URI", "")
+            if not redirect_uri:
+                redirect_uri = st.text_input(
+                    "このアプリのURL（REDIRECT_URI）",
+                    placeholder="https://xxxx.streamlit.app/",
+                    help="freee連携アプリのコールバックURLに登録したURLを入力してください",
+                    key="input_redirect_uri",
+                )
+            if redirect_uri:
+                auth_url = (
+                    "https://accounts.secure.freee.co.jp/public_api/authorize?"
+                    + urllib.parse.urlencode({
+                        "response_type": "code",
+                        "client_id":     st.secrets.get("FREEE_CLIENT_ID", ""),
+                        "redirect_uri":  redirect_uri,
+                        "prompt":        "select_company",
+                    })
+                )
+                # redirect_uri をセッションに保持（コールバック時の交換に使用）
+                st.session_state["_redirect_uri"] = redirect_uri
+                st.link_button("🔗 freeeと連携する", auth_url, use_container_width=True)
+                st.caption(f"認証後 `{redirect_uri}` に戻ります。\nfreee連携アプリのコールバックURLと一致させてください。")
+            else:
+                st.info("上にこのアプリのURLを入力すると連携ボタンが表示されます。")
         else:
-            st.caption("FREEE_CLIENT_ID / REDIRECT_URI を Secrets に設定すると\n"
-                       "ワンクリック連携が使えます。")
+            st.caption("FREEE_CLIENT_ID を Secrets に設定するとワンクリック連携が使えます。")
         with st.expander("🔑 アクセストークンを手動入力"):
             token = st.text_input("freee アクセストークン", type="password",
                                   key="manual_token")
@@ -847,8 +870,9 @@ if generate_btn:
         st.info(f"銀行口座IDマップ: {bank_id_map}")
         st.info(f"科目マスタ件数: {len(acct_map)}")
 
-    cf_data     = {}
-    verify_data = {}
+    cf_data       = {}
+    verify_data   = {}
+    all_rows_pool = []  # 全月の取得済み行（get_past_category の検索用）
 
     for i, mon in enumerate(months):
         key      = str(mon["year"]) + "-" + str(mon["month"])
@@ -857,15 +881,18 @@ if generate_btn:
         e_date   = f"{mon['year']}-{mon['month']:02d}-{last_day}"
         pct      = int(10 + (i / len(months)) * 70)
 
-        progress.progress(pct, text=f"{mon['year']}年{mon['month']}月 取引取得中（deals+manual_journals）...")
+        progress.progress(pct, text=f"{mon['year']}年{mon['month']}月 取引取得中...")
 
         try:
-            entries  = get_all_transactions(token, company_id, bank_account_item_ids, s_date, e_date, acct_map)
+            entries  = get_all_transactions(token, company_id, bank_account_item_ids,
+                                            s_date, e_date, acct_map, debug=debug_mode)
             all_rows = extract_bank_lines(entries, bank_account_item_ids)
             if debug_mode:
                 st.info(f"{mon['year']}年{mon['month']}月: entries={len(entries)}, rows={len(all_rows)}")
             progress.progress(pct + 5, text=f"{mon['year']}年{mon['month']}月 分類中...")
-            agg = aggregate_cf(all_rows, token, company_id, bank_account_item_ids, s_date)
+            # 未払金等の遡及は all_rows_pool（過去月の取得済み行）から検索（APIコールなし）
+            agg = aggregate_cf(all_rows, all_rows_pool)
+            all_rows_pool.extend(all_rows)  # 今月分をプールに追加
         except Exception as e:
             st.warning(f"{mon['year']}年{mon['month']}月: {e}")
             cf_data[key] = {"openingBalance": 0, "closingBalance": 0, "netCF": 0}
