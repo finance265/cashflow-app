@@ -11,25 +11,37 @@ st.caption("freee会計のデータから自動でキャッシュフロー表を
 
 FREEE_BASE = "https://api.freee.co.jp/api/1"
 TOKEN_URL  = "https://accounts.secure.freee.co.jp/public_api/token"
+STORAGE_KEY = "freee_refresh_token"
 
 # ============================================================
-# トークン自動更新（永続ストレージ使用）
+# トークン自動更新（リフレッシュトークンを永続ストレージで管理）
 # ============================================================
-async def save_tokens(access_token, refresh_token):
+def get_stored_refresh_token():
+    """永続ストレージからリフレッシュトークンを取得"""
     try:
-        await window.storage.set("freee_access_token", access_token)
-        await window.storage.set("freee_refresh_token", refresh_token)
+        import streamlit.components.v1 as _c
+        # st.session_stateに保存済みなら使う
+        return st.session_state.get("stored_refresh_token")
     except:
-        pass
+        return None
+
+def save_refresh_token(token):
+    """リフレッシュトークをsession_stateに保存"""
+    st.session_state["stored_refresh_token"] = token
 
 def refresh_access_token():
     """
-    Secretsのリフレッシュトークンで新しいアクセストークンを取得
-    新しいリフレッシュトークンもSecretsに自動保存
+    リフレッシュトークンでアクセストークンを自動更新
+    優先順位: session_state → Secrets
     """
     client_id     = st.secrets.get("FREEE_CLIENT_ID", "")
     client_secret = st.secrets.get("FREEE_CLIENT_SECRET", "")
-    refresh_token = st.secrets.get("FREEE_REFRESH_TOKEN", "")
+
+    # リフレッシュトークンの優先順位: session_state → Secrets
+    refresh_token = (
+        st.session_state.get("stored_refresh_token") or
+        st.secrets.get("FREEE_REFRESH_TOKEN", "")
+    )
 
     if not all([client_id, client_secret, refresh_token]):
         return None
@@ -46,12 +58,14 @@ def refresh_access_token():
         new_access  = data.get("access_token")
         new_refresh = data.get("refresh_token")
 
-        # 新しいリフレッシュトークンをセッションに保存
+        # 新しいリフレッシュトークンをsession_stateに保存
         if new_refresh:
-            st.session_state["latest_refresh_token"] = new_refresh
+            st.session_state["stored_refresh_token"] = new_refresh
 
         return new_access
     except Exception as e:
+        # session_stateのトークンが失効した場合はSecretsのものにフォールバック
+        st.session_state.pop("stored_refresh_token", None)
         return None
 
 # ============================================================
@@ -773,8 +787,11 @@ if generate_btn:
             get_walletable_balance(token, company_id, b["id"], e_date)
             for b in bank_accounts
         )
+        # サンプルをcf_dataに含めて保存
         agg["closingBalance"] = closing
         agg["openingBalance"] = 0
+        agg["_sample_deal"]           = st.session_state.pop("sample_deal", None)
+        agg["_sample_manual_journal"] = st.session_state.pop("sample_manual_journal", None)
         cf_data[key]     = agg
         verify_data[key] = closing
 
@@ -835,17 +852,24 @@ if st.session_state.get("html_result"):
     )
 
     if debug_mode:
-        if st.session_state.get("sample_manual_journal"):
-            with st.expander("🔍 振替伝票サンプル（生データ）"):
-                st.json(st.session_state["sample_manual_journal"])
-        else:
-            st.info("振替伝票サンプルなし")
+        # 最初の月のサンプルを表示
+        first_key = str(months[0]["year"]) + "-" + str(months[0]["month"])
+        first_d   = cf_data.get(first_key, {})
 
-        if st.session_state.get("sample_deal"):
-            with st.expander("🔍 取引サンプル（生データ）"):
-                st.json(st.session_state["sample_deal"])
+        sample_mj = first_d.get("_sample_manual_journal")
+        sample_dl = first_d.get("_sample_deal")
+
+        if sample_mj:
+            with st.expander("🔍 振替伝票サンプル（生データ）"):
+                st.json(sample_mj)
         else:
-            st.info("取引サンプルなし")
+            st.warning("振替伝票サンプルなし（manual_journalsが取得できていない可能性）")
+
+        if sample_dl:
+            with st.expander("🔍 取引サンプル（生データ）"):
+                st.json(sample_dl)
+        else:
+            st.warning("取引サンプルなし（dealsが取得できていない可能性）")
 
         for mon in months:
             key = str(mon["year"]) + "-" + str(mon["month"])
