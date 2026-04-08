@@ -646,23 +646,18 @@ def generate_html(cf_data, company_name, months, bank_names, verify_data):
 with st.sidebar:
     st.header("⚙️ 設定")
 
-    auto_token = None
-    if st.secrets.get("FREEE_REFRESH_TOKEN"):
-        auto_token = refresh_access_token()
+    token = None
 
-    if auto_token:
-        st.success("✅ トークン自動更新済み")
-        token = auto_token
-        # 新しいリフレッシュトークンが発行された場合は表示
-        new_rt = st.session_state.get("latest_refresh_token")
-        if new_rt and new_rt != st.secrets.get("FREEE_REFRESH_TOKEN"):
-            st.warning("⚠️ リフレッシュトークンが更新されました")
-            with st.expander("新しいリフレッシュトークン（Secretsを更新してください）"):
-                st.code(f'FREEE_REFRESH_TOKEN = "{new_rt}"')
-    elif st.secrets.get("FREEE_TOKEN"):
-        st.success("✅ トークン読み込み済み")
-        token = st.secrets.get("FREEE_TOKEN")
+    # リフレッシュトークンで自動更新を試みる
+    if st.secrets.get("FREEE_REFRESH_TOKEN"):
+        token = refresh_access_token()
+        if token:
+            st.success("✅ トークン自動更新済み")
+        else:
+            st.error("❌ 自動更新失敗。手動でトークンを入力してください")
+            token = st.text_input("freee アクセストークン", type="password")
     else:
+        st.warning("Secretsにリフレッシュトークンが設定されていません")
         token = st.text_input("freee アクセストークン", type="password", placeholder="トークンを入力")
 
 if not token:
