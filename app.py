@@ -10,6 +10,36 @@ st.title("🏦 freee キャッシュフロー自動生成")
 st.caption("freee会計のデータから自動でキャッシュフロー表を作成します")
 
 FREEE_BASE = "https://api.freee.co.jp/api/1"
+TOKEN_URL  = "https://accounts.secure.freee.co.jp/public_api/token"
+
+# ============================================================
+# トークン自動更新
+# ============================================================
+def refresh_access_token():
+    """
+    Streamlit CloudのSecretsからリフレッシュトークンを使って
+    アクセストークンを自動更新する
+    """
+    client_id     = st.secrets.get("FREEE_CLIENT_ID", "")
+    client_secret = st.secrets.get("FREEE_CLIENT_SECRET", "")
+    refresh_token = st.secrets.get("FREEE_REFRESH_TOKEN", "")
+
+    if not all([client_id, client_secret, refresh_token]):
+        return None
+
+    try:
+        res = requests.post(TOKEN_URL, data={
+            "grant_type":    "refresh_token",
+            "client_id":     client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token,
+        }, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        return data.get("access_token")
+    except Exception as e:
+        st.warning(f"トークン自動更新エラー: {e}")
+        return None
 
 # ============================================================
 # freee API ヘルパー
@@ -588,8 +618,18 @@ def generate_html(cf_data, company_name, months, bank_names, verify_data):
 # ============================================================
 with st.sidebar:
     st.header("⚙️ 設定")
+
+    # リフレッシュトークンで自動更新を試みる
     saved_token = st.secrets.get("FREEE_TOKEN", "")
-    if saved_token:
+    auto_token  = None
+
+    if st.secrets.get("FREEE_REFRESH_TOKEN"):
+        auto_token = refresh_access_token()
+
+    if auto_token:
+        st.success("✅ トークン自動更新済み")
+        token = auto_token
+    elif saved_token:
         st.success("✅ トークン読み込み済み")
         use_saved = st.checkbox("保存済みトークンを使用", value=True)
         token = saved_token if use_saved else st.text_input("freee アクセストークン", type="password")
