@@ -251,8 +251,12 @@ def get_all_transactions(token, company_id, bank_account_item_ids, start_date, e
             out.append({**det, "account_item_name": name, "partner_name": pname})
         return out
 
+    # 費用系カテゴリ（PLの借方科目のみを payable_lookup に登録する）
+    EXPENSE_CATS = {"売上原価", "販売管理費", "営業外費用", "法人税等"}
+
     def _update_payable_lookup(norm_details, deal_partner=""):
-        """未払金 credit / 費用 debit の仕訳から payable_lookup を構築"""
+        """未払金 credit / 費用 debit の仕訳から payable_lookup を構築。
+        BS科目（売掛金・前払金等）が誤登録されないよう費用科目カテゴリで絞り込む。"""
         # bank が含まれる仕訳はスキップ（別途 bank_entries として処理）
         if any(d.get("account_item_id") in bank_account_item_ids for d in norm_details):
             return
@@ -262,11 +266,12 @@ def get_all_transactions(token, company_id, bank_account_item_ids, start_date, e
         payable_credits = [d for d in credits if d.get("account_item_name", "") in PAYABLE_ACCTS]
         if not payable_credits:
             return
-        # debit 側の費用科目を特定（未払金・銀行以外）
+        # debit 側の「費用系科目」のみを特定（BS科目・未払金・銀行を除外）
         expense_debits = [
             d for d in debits
             if d.get("account_item_name", "") not in PAYABLE_ACCTS
             and d.get("account_item_id") not in bank_account_item_ids
+            and acct_map.get(d.get("account_item_id"), {}).get("category", "") in EXPENSE_CATS
         ]
         if not expense_debits:
             return
@@ -339,10 +344,22 @@ def get_all_transactions(token, company_id, bank_account_item_ids, start_date, e
 
     return bank_entries, payable_lookup
 
-def get_trial_bs_balances(token, company_id, bank_account_item_ids, year, month):
-    """trial_bs から月初・月末残高を取得。fiscal_year を year / year-1 の順で試みる。
+def get_trial_bs_balances(token, company_id, bank_account_item_ids, year, month, fy_end_month=None):
+    """trial_bs から月初・月末残高を取得。
+    fy_end_month: 会社の決算月（1-12）。指定があれば正確な fiscal_year を計算する。
     Returns: (opening_balance, closing_balance) or (None, None)"""
-    for fy in [year, year - 1]:
+    # 正しい fiscal_year を計算する
+    if fy_end_month:
+        # 決算月から期首月を計算: 決算月=3 → 期首=4, 決算月=12 → 期首=1
+        fy_start_month = (fy_end_month % 12) + 1
+        # 対象カレンダー月が期首月より前なら前年度
+        correct_fy = year if month >= fy_start_month else year - 1
+        fy_candidates = [correct_fy]  # 正確な年だけ試す（誤った年で正常応答が返るのを防ぐ）
+    else:
+        # 決算月不明の場合は両方試す（year-1 を先に試す方が日本企業では多い）
+        fy_candidates = [year - 1, year]
+
+    for fy in fy_candidates:
         try:
             d = freee_get("/reports/trial_bs", token, company_id, {
                 "fiscal_year":               fy,
@@ -370,10 +387,12 @@ def get_trial_bs_balances(token, company_id, bank_account_item_ids, year, month)
 # ============================================================
 # 仕訳から銀行が動いた行を抽出
 # ============================================================
-def extract_bank_lines(journals, bank_account_item_ids):
+def extract_bank_lines(journals, bank_account_item_ids, acct_map=None):
     """
-    仕訳帳の全仕訳から銀行口座が含まれる行を抽出してCF行に変換
+    仕訳帳の全仕訳から銀行口座が含まれる行を抽出してCF行に変換。
+    acct_map: {account_item_id: {"name": str, "category": str}} — category付与に使用
     """
+    acct_map = acct_map or {}
     results = []
     for j in journals:
         # 仕訳帳APIのレスポンス構造に対応（複数パターン）
@@ -412,6 +431,7 @@ def extract_bank_lines(journals, bank_account_item_ids):
                 j.get("partner_name") or j.get("partner_long_name") or ""
             )
 
+            counter_cat = ""
             if other_lines:
                 best = max(other_lines, key=lambda x: x.get("amount", 0))
                 counter_account = (
@@ -419,6 +439,9 @@ def extract_bank_lines(journals, bank_account_item_ids):
                     best.get("account_name") or
                     ""
                 )
+                # account_category を acct_map から解決
+                best_aid = best.get("account_item_id")
+                counter_cat = acct_map.get(best_aid, {}).get("category", "")
                 if best.get("partner_name") or best.get("partner_long_name"):
                     counter_partner = best.get("partner_name") or best.get("partner_long_name") or ""
 
@@ -427,6 +450,7 @@ def extract_bank_lines(journals, bank_account_item_ids):
                 "amount":      net,
                 "partner":     counter_partner,
                 "account":     counter_account,
+                "account_cat": counter_cat,   # ← account_category を追加
                 "description": bl.get("description") or j.get("description") or "",
                 "source":      "journal",
             })
@@ -455,114 +479,130 @@ def is_personal_name(name):
         return True
     return False
 
-ACCOUNT_MAP = {
-    "売掛金":         "売上の入金",
-    "前受金":         "売上の入金",
-    "未収入金":       "売上の入金",
-    "未収利息":       "売上の入金",
-    "受取利息":       "売上の入金",
-    "雑収入":         "売上の入金",
-    "預り金":         "売上の入金",
-    "広告宣伝費":     "広告宣伝費",
-    "役員報酬":       "人件費",
-    "給与手当":       "人件費",
-    "給与":           "人件費",
-    "賞与":           "人件費",
-    "法定福利費":     "人件費",
-    "社会保険料":     "人件費",
-    "労働保険料":     "人件費",
+# ── account_category（freee共通）→ CF大分類 ─────────────────────────────
+# freee の account_category は全事業所共通の体系のため、これをベースにすると汎用性が高い
+CATEGORY_CF_MAP = {
+    # 収入系 PL
+    "売上高":         "売上の入金",   # 売上高, 役務収益, 完成工事高, 売上値引高 等
+    "営業外収益":     "売上の入金",   # 受取利息, 雑収入, 受取配当金, 為替差益 等
+    "特別利益":       "売上の入金",   # 固定資産売却益, 貸倒引当金戻入益 等
+
+    # 費用系 PL
+    "当期商品仕入":   "原価",         # 仕入高, 仕入高_外注費 等
+    "棚卸資産":       "原価",         # 商品・仕掛品の増減
     "法人税等":       "税金",
-    "租税公課":       "税金",
-    "源泉所得税":     "税金",
-    "長期借入金":     "_借入",
-    "短期借入金":     "_借入",
-    "支払利息":       "借入の返済",
-    "未払利息":       "借入の返済",
-    "長期未払金":     "借入の返済",
-    "長期貸付金":     "_貸付",
-    "短期貸付金":     "_貸付",
-    "外注費":         "_外注",
-    "業務委託費":     "_外注",
-    "顧問料":         "販管費",
-    "採用教育費":     "販管費",
-    "研修費":         "販管費",
-    "交際費":         "販管費",
-    "会議費":         "販管費",
-    "旅費交通費":     "販管費",
-    "通信費":         "販管費",
-    "消耗品費":       "販管費",
-    "水道光熱費":     "販管費",
-    "支払手数料":     "販管費",
-    "システム利用料": "販管費",
-    "地代家賃":       "販管費",
-    "賃借料":         "販管費",
-    "リース料":       "販管費",
-    "保険料":         "販管費",
-    "支払報酬料":     "販管費",
-    "研究開発費":     "販管費",
-    "新聞図書費":     "販管費",
-    "諸会費":         "販管費",
-    "荷造運賃":       "販管費",
-    "車両費":         "販管費",
-    "修繕費":         "販管費",
-    "寄付金":         "販管費",
-    "差入保証金":     "販管費",
-    "未払金":         "_要遡及",
-    "未払費用":       "_要遡及",
-    "BD興行未払金":   "_要遡及",
-    "スクール未払金": "_要遡及",
-    "立替金":         "_要遡及",
-    "仮払金":         "_要遡及",
-    "経費精算":       "_要遡及",
-    "前払費用":       "_要遡及",
-    "仮受金":         "_要遡及",
+    "法人税等調整額": "税金",
+    "特別損失":       "販管費",       # 固定資産除却損, 投資有価証券売却損 等
+
+    # 財務系 BS
+    "固定負債":       "_借入",        # 長期借入金の増減（入金=借入, 出金=返済）
+    "投資その他の資産": "_貸付",      # 長期貸付金の増減（出金=貸付, 入金=回収）
+
+    # 遡及が必要な BS（銀行仕訳の相手が中間科目のケース）
+    "売上債権":       "_要遡及",      # 売掛金・受取手形 → 売上の入金の可能性高
+    "他流動資産":     "_要遡及",      # 仮払金・前払費用・立替金・未収入金・短期貸付金 等
+    "仕入債務":       "_要遡及",      # 買掛金・工事未払金 → 原価の可能性高
+    "他流動負債":     "_要遡及",      # 未払金系（クレカ含む）・仮受金 等
+
+    # 販売管理費は後段の account_name 細分類で処理（ここには含めない）
+    # 営業外費用は 支払利息=借入の返済 / 他=販管費 なので後段処理
 }
 
-def _classify_account_name(account_name, partner="", amount=0):
-    """科目名からCFカテゴリを返す（payable_lookup 解決後に使用）"""
-    if account_name.startswith("仕入高"):
-        return "原価"
-    if account_name.startswith("売上高"):
-        return "売上の入金"
-    cat = ACCOUNT_MAP.get(account_name)
-    if cat == "_借入":
+# ── account_name 細分類（販売管理費・営業外費用 内の精緻化に使用）──────────
+# ★ CATEGORY_CF_MAP で解決できない科目だけを列挙。新設科目は category で自動対応。
+ACCOUNT_NAME_MAP = {
+    # 販売管理費カテゴリ内：人件費として扱う科目
+    "役員報酬":   "人件費",
+    "給与手当":   "人件費",
+    "給与":       "人件費",
+    "賞与":       "人件費",
+    "法定福利費": "人件費",
+    "社会保険料": "人件費",
+    "労働保険料": "人件費",
+    "雇用保険料": "人件費",
+    "退職金":     "人件費",
+
+    # 販売管理費カテゴリ内：外注費（個人名なら人件費扱い）
+    "外注費":       "_外注",
+    "業務委託費":   "_外注",
+    "フリーランス": "_外注",
+
+    # 販売管理費カテゴリ内：広告宣伝費
+    "広告宣伝費": "広告宣伝費",
+    "広告費":     "広告宣伝費",
+    "宣伝費":     "広告宣伝費",
+    "販促費":     "広告宣伝費",
+
+    # 営業外費用カテゴリ内：利息系は借入の返済
+    "支払利息":   "借入の返済",
+    "未払利息":   "借入の返済",
+    "割引料":     "借入の返済",
+
+    # 法人税等カテゴリ以外の税金系（租税公課は販売管理費カテゴリ）
+    "租税公課":   "税金",
+    "源泉所得税": "税金",
+}
+
+def _resolve_cf(account_name, account_cat, partner, amount, acct_map_entry=None):
+    """科目名 + account_category → CF分類を返す汎用関数。
+    account_cat: acct_map から取得した account_category 文字列
+    acct_map_entry: {"name": str, "category": str}
+    """
+    # ① account_category ベースの大分類（汎用・新設科目対応）
+    cat_cf = CATEGORY_CF_MAP.get(account_cat, "")
+    if cat_cf and not cat_cf.startswith("_"):
+        # 販売管理費カテゴリ内は account_name で細分類するため別処理
+        pass
+    elif cat_cf == "_借入":
         return "借入による収入" if amount > 0 else "借入の返済"
-    if cat == "_貸付":
+    elif cat_cf == "_貸付":
         return "貸付の回収" if amount > 0 else "貸付による支出"
-    if cat == "_外注":
+    elif cat_cf == "_要遡及":
+        return "_要遡及"
+
+    # ② account_name 細分類（人件費・外注費・広告宣伝費など）
+    name_cf = ACCOUNT_NAME_MAP.get(account_name, "")
+    if name_cf == "_外注":
         return "人件費" if is_personal_name(partner) else "販管費"
-    if cat and not cat.startswith("_"):
-        return cat
-    return "販管費"
+    if name_cf:
+        return name_cf
 
-def classify_row(row, skip_lookup=False, payable_lookup=None):
-    account = row.get("account", "")
-    partner = row.get("partner", "")
-    amount  = row.get("amount", 0)
+    # ③ account_category の大分類を適用（販売管理費→販管費、営業外収益→売上の入金 等）
+    if cat_cf and not cat_cf.startswith("_"):
+        return cat_cf
 
-    if account.startswith("仕入高"):
-        return "原価"
-    if account.startswith("売上高"):
-        return "売上の入金"
+    # ④ フォールバック（category 不明 or 未定義）
+    return "売上の入金" if amount > 0 else "販管費"
 
-    cat = ACCOUNT_MAP.get(account)
-    if cat == "_借入":
-        return "借入による収入" if amount > 0 else "借入の返済"
-    if cat == "_貸付":
-        return "貸付の回収" if amount > 0 else "貸付による支出"
-    if cat == "_外注":
-        return "人件費" if is_personal_name(partner) else "販管費"
-    if cat == "_要遡及":
+
+def _classify_account_name(account_name, partner="", amount=0, acct_map=None):
+    """payable_lookup 解決後に使用。科目名 → CF分類を返す。"""
+    # acct_map から category を引いて _resolve_cf に委譲
+    acct_map = acct_map or {}
+    entry = next((v for v in acct_map.values() if v.get("name") == account_name), {})
+    account_cat = entry.get("category", "")
+    result = _resolve_cf(account_name, account_cat, partner, amount)
+    # _要遡及 が返ってきた場合は販管費にフォールバック
+    return result if result != "_要遡及" else "販管費"
+
+
+def classify_row(row, skip_lookup=False, payable_lookup=None, acct_map=None):
+    account     = row.get("account", "")
+    partner     = row.get("partner", "")
+    amount      = row.get("amount", 0)
+    account_cat = row.get("account_cat", "")  # extract_bank_lines で付与
+
+    result = _resolve_cf(account, account_cat, partner, amount)
+
+    if result == "_要遡及":
         # payable_lookup で partner → expense_account を解決
         if payable_lookup and partner:
             exp_acct = payable_lookup.get(partner)
             if exp_acct:
-                return _classify_account_name(exp_acct, partner, amount)
+                return _classify_account_name(exp_acct, partner, amount, acct_map)
         return None if not skip_lookup else "販管費"
-    if cat:
-        return cat
 
-    return "売上の入金" if amount > 0 else "販管費"
+    return result
 
 def get_past_category(partner, lookup_rows):
     """APIコールなし：取得済み全仕訳から同取引先の過去行を検索してカテゴリを推定"""
@@ -573,14 +613,14 @@ def get_past_category(partner, lookup_rows):
         return cache[partner]
     for line in lookup_rows:
         if line.get("partner") == partner:
-            cat = classify_row(line, skip_lookup=True)
-            if cat:
+            cat = classify_row(line, skip_lookup=True, acct_map=None)
+            if cat and cat != "_要遡及":
                 cache[partner] = cat
                 return cat
     cache[partner] = "販管費"
     return "販管費"
 
-def aggregate_cf(rows, lookup_rows, payable_lookup=None):
+def aggregate_cf(rows, lookup_rows, payable_lookup=None, acct_map=None):
     cats = {
         "売上の入金": 0, "原価": 0, "広告宣伝費": 0, "販管費": 0,
         "人件費": 0, "税金": 0, "借入による収入": 0, "貸付の回収": 0,
@@ -589,7 +629,7 @@ def aggregate_cf(rows, lookup_rows, payable_lookup=None):
     unclassified = []
 
     for row in rows:
-        cat = classify_row(row, payable_lookup=payable_lookup)
+        cat = classify_row(row, payable_lookup=payable_lookup, acct_map=acct_map)
         if cat is None:
             cat = get_past_category(row.get("partner", ""), lookup_rows)
             row["_resolved"] = cat
@@ -968,9 +1008,16 @@ if generate_btn:
         st.warning(f"科目マスタ取得失敗（処理継続）: {e}")
         acct_map = {}
 
+    # 決算月を取得（trial_bs の fiscal_year を正確に計算するために必要）
+    fy_end_month = next(
+        (c.get("fiscal_year_end_month") for c in companies if c["id"] == company_id),
+        None
+    )
+
     if debug_mode:
         st.info(f"銀行口座IDマップ: {bank_id_map}")
         st.info(f"科目マスタ件数: {len(acct_map)}")
+        st.info(f"決算月: {fy_end_month}月")
 
     cf_data       = {}
     verify_data   = {}
@@ -989,12 +1036,12 @@ if generate_btn:
             entries, payable_lookup = get_all_transactions(
                 token, company_id, bank_account_item_ids,
                 s_date, e_date, acct_map, debug=debug_mode)
-            all_rows = extract_bank_lines(entries, bank_account_item_ids)
+            all_rows = extract_bank_lines(entries, bank_account_item_ids, acct_map=acct_map)
             if debug_mode:
                 st.info(f"{mon['year']}年{mon['month']}月: entries={len(entries)}, rows={len(all_rows)}, "
                         f"payable_lookup={len(payable_lookup)}件")
             progress.progress(pct + 5, text=f"{mon['year']}年{mon['month']}月 分類中...")
-            agg = aggregate_cf(all_rows, all_rows_pool, payable_lookup=payable_lookup)
+            agg = aggregate_cf(all_rows, all_rows_pool, payable_lookup=payable_lookup, acct_map=acct_map)
             all_rows_pool.extend(all_rows)
         except Exception as e:
             st.warning(f"{mon['year']}年{mon['month']}月 取得エラー: {e}")
@@ -1004,9 +1051,11 @@ if generate_btn:
 
         # trial_bs から残高を取得（walletable_balance API は使わない）
         opening, closing = get_trial_bs_balances(
-            token, company_id, bank_account_item_ids, mon["year"], mon["month"])
+            token, company_id, bank_account_item_ids, mon["year"], mon["month"],
+            fy_end_month=fy_end_month)
         if opening is None:
-            st.warning(f"{mon['year']}年{mon['month']}月: trial_bs から残高を取得できませんでした")
+            st.warning(f"{mon['year']}年{mon['month']}月: trial_bs から残高を取得できませんでした "
+                       f"（決算月={fy_end_month}, fiscal_year 候補を確認してください）")
             opening = closing = 0
         agg["openingBalance"] = opening
         agg["closingBalance"] = closing
