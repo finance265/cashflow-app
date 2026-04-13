@@ -252,7 +252,8 @@ def get_all_transactions(token, company_id, bank_account_item_ids, start_date, e
         return out
 
     # 費用系カテゴリ（PLの借方科目のみを payable_lookup に登録する）
-    EXPENSE_CATS = {"売上原価", "販売管理費", "営業外費用", "法人税等"}
+    # 注: freee では 仕入高 の category = "当期商品仕入"（"売上原価" ではない）
+    EXPENSE_CATS = {"売上原価", "当期商品仕入", "販売管理費", "営業外費用", "法人税等"}
 
     def _update_payable_lookup(norm_details, deal_partner=""):
         """未払金 credit / 費用 debit の仕訳から payable_lookup を構築。
@@ -291,6 +292,15 @@ def get_all_transactions(token, company_id, bank_account_item_ids, start_date, e
         for p in partners:
             if p and p not in payable_lookup:
                 payable_lookup[p] = exp_name
+        # partner が全員空の場合: account_item_id をキーにして登録
+        # (未払金の account_item_id → expense_name のマッピング)
+        if not partners:
+            for pc in payable_credits:
+                pc_aid = pc.get("account_item_id")
+                if pc_aid:
+                    aid_key = f"_aid:{pc_aid}"
+                    if aid_key not in payable_lookup:
+                        payable_lookup[aid_key] = exp_name
 
     # ---- deals ----
     deals_raw = 0
@@ -432,6 +442,7 @@ def extract_bank_lines(journals, bank_account_item_ids, acct_map=None):
             )
 
             counter_cat = ""
+            counter_aid = None
             if other_lines:
                 best = max(other_lines, key=lambda x: x.get("amount", 0))
                 counter_account = (
@@ -439,9 +450,10 @@ def extract_bank_lines(journals, bank_account_item_ids, acct_map=None):
                     best.get("account_name") or
                     ""
                 )
-                # account_category を acct_map から解決
+                # account_category と account_item_id を acct_map から解決
                 best_aid = best.get("account_item_id")
                 counter_cat = acct_map.get(best_aid, {}).get("category", "")
+                counter_aid = best_aid  # _要遡及 の取引先不明時フォールバック用
                 if best.get("partner_name") or best.get("partner_long_name"):
                     counter_partner = best.get("partner_name") or best.get("partner_long_name") or ""
 
@@ -450,7 +462,8 @@ def extract_bank_lines(journals, bank_account_item_ids, acct_map=None):
                 "amount":      net,
                 "partner":     counter_partner,
                 "account":     counter_account,
-                "account_cat": counter_cat,   # ← account_category を追加
+                "account_cat": counter_cat,   # account_category
+                "account_aid": counter_aid,   # account_item_id（_要遡及 の fallback 用）
                 "description": bl.get("description") or j.get("description") or "",
                 "source":      "journal",
             })
@@ -498,10 +511,12 @@ CATEGORY_CF_MAP = {
     "固定負債":       "_借入",        # 長期借入金の増減（入金=借入, 出金=返済）
     "投資その他の資産": "_貸付",      # 長期貸付金の増減（出金=貸付, 入金=回収）
 
-    # 遡及が必要な BS（銀行仕訳の相手が中間科目のケース）
-    "売上債権":       "_要遡及",      # 売掛金・受取手形 → 売上の入金の可能性高
+    # 発生月と支払月が別なのが大前提のため、売掛金回収＝売上の入金、買掛金支払＝原価で直接分類
+    "売上債権":       "売上の入金",   # 売掛金・受取手形の回収は常に売上の入金
+    "仕入債務":       "原価",         # 買掛金・工事未払金の支払は常に原価
+
+    # 遡及が必要な BS（未払金等の中間科目 → payable_lookup で費用科目を解決）
     "他流動資産":     "_要遡及",      # 仮払金・前払費用・立替金・未収入金・短期貸付金 等
-    "仕入債務":       "_要遡及",      # 買掛金・工事未払金 → 原価の可能性高
     "他流動負債":     "_要遡及",      # 未払金系（クレカ含む）・仮受金 等
 
     # 販売管理費は後段の account_name 細分類で処理（ここには含めない）
@@ -541,6 +556,11 @@ ACCOUNT_NAME_MAP = {
     # 法人税等カテゴリ以外の税金系（租税公課は販売管理費カテゴリ）
     "租税公課":   "税金",
     "源泉所得税": "税金",
+
+    # その他（仮受金の返還等、経常収支に含めるが内訳を明示したい科目）
+    "仮受金":     "その他",
+    "前受金":     "その他",
+    "預り金":     "その他",
 }
 
 def _resolve_cf(account_name, account_cat, partner, amount, acct_map_entry=None):
@@ -558,6 +578,10 @@ def _resolve_cf(account_name, account_cat, partner, amount, acct_map_entry=None)
     elif cat_cf == "_貸付":
         return "貸付の回収" if amount > 0 else "貸付による支出"
     elif cat_cf == "_要遡及":
+        # account_name で直接解決できる科目（仮受金等）はここで確定
+        name_cf_early = ACCOUNT_NAME_MAP.get(account_name, "")
+        if name_cf_early and not name_cf_early.startswith("_"):
+            return name_cf_early
         return "_要遡及"
 
     # ② account_name 細分類（人件費・外注費・広告宣伝費など）
@@ -569,6 +593,10 @@ def _resolve_cf(account_name, account_cat, partner, amount, acct_map_entry=None)
 
     # ③ account_category の大分類を適用（販売管理費→販管費、営業外収益→売上の入金 等）
     if cat_cf and not cat_cf.startswith("_"):
+        # 売上系カテゴリでも出金（amount < 0）の場合は販管費扱い
+        # （売上値引高・売上戻り高などの返金仕訳が出金として現れるケース）
+        if cat_cf == "売上の入金" and amount < 0:
+            return "販管費"
         return cat_cf
 
     # ④ フォールバック（category 不明 or 未定義）
@@ -595,11 +623,20 @@ def classify_row(row, skip_lookup=False, payable_lookup=None, acct_map=None):
     result = _resolve_cf(account, account_cat, partner, amount)
 
     if result == "_要遡及":
-        # payable_lookup で partner → expense_account を解決
+        # ① partner 名で解決
         if payable_lookup and partner:
             exp_acct = payable_lookup.get(partner)
             if exp_acct:
                 return _classify_account_name(exp_acct, partner, amount, acct_map)
+        # ② partner 名がない場合: 相手科目の account_item_id で解決
+        #    （未払金仕訳に取引先名がない場合のフォールバック）
+        if payable_lookup:
+            row_aid = row.get("account_aid", "")
+            if row_aid:
+                aid_key = f"_aid:{row_aid}"
+                exp_acct = payable_lookup.get(aid_key)
+                if exp_acct:
+                    return _classify_account_name(exp_acct, partner, amount, acct_map)
         return None if not skip_lookup else "販管費"
 
     return result
@@ -623,21 +660,31 @@ def get_past_category(partner, lookup_rows):
 def aggregate_cf(rows, lookup_rows, payable_lookup=None, acct_map=None):
     cats = {
         "売上の入金": 0, "原価": 0, "広告宣伝費": 0, "販管費": 0,
-        "人件費": 0, "税金": 0, "借入による収入": 0, "貸付の回収": 0,
+        "人件費": 0, "税金": 0, "その他": 0,
+        "借入による収入": 0, "貸付の回収": 0,
         "貸付による支出": 0, "借入の返済": 0,
     }
     unclassified = []
+    other_accounts = {}  # {科目名 → 合計金額} その他カテゴリの内訳
 
     for row in rows:
         cat = classify_row(row, payable_lookup=payable_lookup, acct_map=acct_map)
         if cat is None:
             cat = get_past_category(row.get("partner", ""), lookup_rows)
+            # 過去参照で「売上の入金」に解決されても出金（amount<0）なら販管費に転換
+            # （例: 仮受金・立替金の返還が売上入金パートナーへの支払と誤判定されるケース）
+            if cat == "売上の入金" and row.get("amount", 0) < 0:
+                cat = "販管費"
             row["_resolved"] = cat
             unclassified.append(row)
-        cats[cat] += row.get("amount", 0)
+        cats[cat] = cats.get(cat, 0) + row.get("amount", 0)
+        # その他カテゴリの内訳を記録
+        if cat == "その他":
+            acct_name = row.get("account", "不明")
+            other_accounts[acct_name] = other_accounts.get(acct_name, 0) + row.get("amount", 0)
 
     収入計    = cats["売上の入金"]
-    支出計    = sum(cats[k] for k in ["原価", "広告宣伝費", "販管費", "人件費", "税金"])
+    支出計    = sum(cats[k] for k in ["原価", "広告宣伝費", "販管費", "人件費", "税金", "その他"])
     経常収支   = 収入計 + 支出計
     財務収入計  = cats["借入による収入"] + cats["貸付の回収"]
     財務支出計  = cats["貸付による支出"] + cats["借入の返済"]
@@ -651,6 +698,7 @@ def aggregate_cf(rows, lookup_rows, payable_lookup=None, acct_map=None):
         "財務収支": 財務収支, "netCF": netCF,
         "_unclassified": unclassified,
         "_all_rows": rows,
+        "_other_accounts": other_accounts,
     }
 
 # ============================================================
@@ -722,6 +770,18 @@ def generate_html(cf_data, company_name, months, bank_names, verify_data):
         ) + '</td>'
         for m in months)
     col_headers = "".join(f"<th>{m['year']}年{m['month']}月</th>" for m in months)
+
+    # 「その他」内訳フットノート
+    other_lines = []
+    for m in months:
+        other_accts = cf_data.get(mk(m), {}).get("_other_accounts", {})
+        if other_accts:
+            parts = []
+            for acct_name, total in sorted(other_accts.items(), key=lambda x: abs(x[1]), reverse=True):
+                sign = "▲ " if total < 0 else ""
+                parts.append(f"{acct_name}: {sign}{abs(int(total)):,}円")
+            other_lines.append(f"　{m['year']}年{m['month']}月: {' / '.join(parts)}")
+    other_footnote = "<br>    ".join(other_lines) if other_lines else "（該当なし）"
 
     return f"""<!DOCTYPE html>
 <html lang="ja">
@@ -806,7 +866,7 @@ def generate_html(cf_data, company_name, months, bank_names, verify_data):
         <td class="bg-bal">月初繰越残高　(A)</td>{bal_cells("openingBalance")}
       </tr>
       <tr class="r-normal">
-        <td class="g-label g-keijo" rowspan="9">経常収支</td>
+        <td class="g-label g-keijo" rowspan="10">経常収支</td>
         <td class="bg-inc"></td><td>売上の入金</td>{cells("売上の入金")}
       </tr>
       <tr class="r-sub-inc"><td class="bg-inc"></td><td>収入計　(B)</td>{cells("収入計")}</tr>
@@ -815,6 +875,7 @@ def generate_html(cf_data, company_name, months, bank_names, verify_data):
       <tr class="r-normal"><td class="bg-exp"></td><td>販管費（外注費含む）</td>{cells("販管費")}</tr>
       <tr class="r-normal"><td class="bg-exp"></td><td>人件費</td>{cells("人件費")}</tr>
       <tr class="r-normal"><td class="bg-exp"></td><td>税金</td>{cells("税金")}</tr>
+      <tr class="r-normal"><td class="bg-exp"></td><td>その他 ※</td>{cells("その他")}</tr>
       <tr class="r-sub-exp"><td class="bg-exp"></td><td>支出計　(C)</td>{cells("支出計")}</tr>
       <tr class="r-total"><td class="bg-gry"></td><td>経常収支　(D)=(B)-(C)</td>{total_cells("経常収支")}</tr>
       <tr class="r-normal">
@@ -849,7 +910,10 @@ def generate_html(cf_data, company_name, months, bank_names, verify_data):
   <div class="footnote">
     ※ 仕訳帳から銀行口座が動いた仕訳を抽出して集計しています。<br>
     ※ 外注費・業務委託費は取引先名で個人名判定し、個人名の場合は人件費に分類しています。<br>
-    ※ 未払金等で分類不明の場合は同取引先の過去3ヶ月仕訳を参照して分類しています。<br>
+    ※ 未払金等で分類不明の場合は同取引先の過去仕訳を参照して分類しています。<br>
+    ※ 売掛金回収は「売上の入金」、買掛金支払は「原価」に分類します（発生月・支払月が別の場合も同様）。<br>
+    ※ 「その他 ※」の内訳（仮受金・前受金・預り金等）:<br>
+    {other_footnote}
     ※ 出力日: {today}
   </div>
 </div>
@@ -1019,9 +1083,30 @@ if generate_btn:
         st.info(f"科目マスタ件数: {len(acct_map)}")
         st.info(f"決算月: {fy_end_month}月")
 
-    cf_data       = {}
-    verify_data   = {}
-    all_rows_pool = []  # 全月の取得済み行（get_past_category の検索用）
+    cf_data              = {}
+    verify_data          = {}
+    all_rows_pool        = []  # 全月の取得済み行（get_past_category の検索用）
+    cumulative_payable   = {}  # 月をまたいで累積する payable_lookup
+
+    # ── 前月の payable_lookup を先読み ──────────────────────────────────────
+    # 例: 1月の役員報酬が「12月発生→1月支払い」のケースに対応
+    progress.progress(8, text="前月の発生仕訳を先読み中...")
+    try:
+        first_mon  = months[0]
+        pre_year   = first_mon["year"] if first_mon["month"] > 1 else first_mon["year"] - 1
+        pre_month  = first_mon["month"] - 1 if first_mon["month"] > 1 else 12
+        pre_last   = monthrange(pre_year, pre_month)[1]
+        pre_s      = f"{pre_year}-{pre_month:02d}-01"
+        pre_e      = f"{pre_year}-{pre_month:02d}-{pre_last}"
+        _, pre_payable = get_all_transactions(
+            token, company_id, bank_account_item_ids,
+            pre_s, pre_e, acct_map, debug=False)
+        cumulative_payable.update(pre_payable)
+        if debug_mode and pre_payable:
+            st.caption(f"前月({pre_year}/{pre_month}) payable先読み: {len(pre_payable)}件 — {list(pre_payable.items())[:5]}")
+    except Exception as e:
+        if debug_mode:
+            st.caption(f"前月先読みスキップ: {e}")
 
     for i, mon in enumerate(months):
         key      = str(mon["year"]) + "-" + str(mon["month"])
@@ -1033,13 +1118,19 @@ if generate_btn:
         progress.progress(pct, text=f"{mon['year']}年{mon['month']}月 取引取得中...")
 
         try:
-            entries, payable_lookup = get_all_transactions(
+            entries, month_payable = get_all_transactions(
                 token, company_id, bank_account_item_ids,
                 s_date, e_date, acct_map, debug=debug_mode)
+            # 今月の payable_lookup を累積辞書にマージ（既存エントリは上書きしない）
+            for k, v in month_payable.items():
+                if k not in cumulative_payable:
+                    cumulative_payable[k] = v
+            payable_lookup = cumulative_payable  # 累積版を使用
+
             all_rows = extract_bank_lines(entries, bank_account_item_ids, acct_map=acct_map)
             if debug_mode:
                 st.info(f"{mon['year']}年{mon['month']}月: entries={len(entries)}, rows={len(all_rows)}, "
-                        f"payable_lookup={len(payable_lookup)}件")
+                        f"今月payable={len(month_payable)}件, 累積payable={len(cumulative_payable)}件")
             progress.progress(pct + 5, text=f"{mon['year']}年{mon['month']}月 分類中...")
             agg = aggregate_cf(all_rows, all_rows_pool, payable_lookup=payable_lookup, acct_map=acct_map)
             all_rows_pool.extend(all_rows)
