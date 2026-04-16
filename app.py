@@ -4,10 +4,22 @@ import requests
 import re
 import json
 import os
+import csv
+import io
+import time
 import urllib.parse
 import pandas as pd
 from datetime import date, timedelta
 from calendar import monthrange
+
+try:
+    import openpyxl
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.datavalidation import DataValidation
+    _HAS_OPENPYXL = True
+except ImportError:
+    _HAS_OPENPYXL = False
 
 # ============================================================
 # トークンファイル永続化
@@ -202,6 +214,116 @@ def get_bank_account_item_ids_from_walletables(bank_accounts):
             result[w["name"]] = aid
     return result
 
+def get_journals_bank_entries(token, company_id, bank_account_names, start_date, end_date,
+                              acct_map, debug=False):
+    """仕訳帳CSVエクスポートから銀行仕訳を全件取得。
+    deals/manual_journals の区別なく、freeeに登録されている全仕訳を対象とする。
+    CSV列構造（freee標準）:
+      [0]借方コード [3]取引日 [4]借方科目名 [8]借方金額 [10]貸方科目名
+      [14]貸方金額 [16]摘要 [17]取引先名(visible_attributes=partner_name)
+    Returns: (bank_entries, payable_lookup)
+    """
+    bank_names_set = set(bank_account_names)
+    name_to_info = {v["name"]: {"category": v["category"], "id": k}
+                    for k, v in acct_map.items()}
+    PAYABLE_ACCTS = {"未払金", "未払費用", "BD興行未払金", "スクール未払金", "未払消費税等", "未払法人税等"}
+    EXPENSE_CATS  = {"売上原価", "当期商品仕入", "販売管理費", "営業外費用", "法人税等"}
+
+    # ── 1. ジョブ作成 ────────────────────────────────────────────────────
+    job_resp = freee_get("/journals", token, company_id, {
+        "download_type": "csv",
+        "start_date":    start_date,
+        "end_date":      end_date,
+        "visible_attributes[]": "partner_name",   # 取引先名を追加
+    })
+    job_id = job_resp.get("journals", {}).get("id")
+    if not job_id:
+        raise ValueError(f"仕訳帳ジョブ作成失敗: {job_resp}")
+
+    # ── 2. 完了待ち（最大90秒）──────────────────────────────────────────
+    for _ in range(30):
+        st_resp = freee_get(f"/journals/reports/{job_id}/status", token, company_id)
+        if st_resp.get("journals", {}).get("status") == "uploaded":
+            break
+        time.sleep(3)
+    else:
+        raise TimeoutError("仕訳帳ダウンロードがタイムアウトしました（90秒）")
+
+    # ── 3. ダウンロード（SJIS/cp932デコード）──────────────────────────
+    dl_url = f"{FREEE_BASE}/journals/reports/{job_id}/download"
+    dl_resp = requests.get(
+        dl_url,
+        headers={"Authorization": f"Bearer {token}"},
+        params={"company_id": company_id},
+        timeout=60,
+    )
+    dl_resp.raise_for_status()
+    csv_text = dl_resp.content.decode("cp932", errors="replace")
+
+    # ── 4. CSV解析 ───────────────────────────────────────────────────────
+    bank_entries   = []
+    payable_lookup = {}
+    total_rows = bank_hit = 0
+
+    reader = csv.reader(io.StringIO(csv_text))
+    for row in reader:
+        if len(row) < 15:
+            continue
+        total_rows += 1
+        try:
+            date_str = row[3].replace("/", "-")          # "2026/03/01" → "2026-03-01"
+            dr_name  = row[4].strip()                    # 借方勘定科目名
+            dr_amt   = int(row[8])  if row[8].strip().lstrip("-").isdigit()  else 0
+            cr_name  = row[10].strip()                   # 貸方勘定科目名
+            cr_amt   = int(row[14]) if row[14].strip().lstrip("-").isdigit() else 0
+            desc     = row[16].strip() if len(row) > 16 else ""
+            partner  = row[17].strip() if len(row) > 17 else ""  # 取引先名
+        except (ValueError, IndexError):
+            continue
+
+        if not date_str or len(date_str) < 8 or not dr_name or not cr_name:
+            continue
+
+        dr_is_bank = dr_name in bank_names_set
+        cr_is_bank = cr_name in bank_names_set
+
+        if not dr_is_bank and not cr_is_bank:
+            # payable_lookup: 費用Dr / 未払金Cr の発生仕訳
+            if cr_name in PAYABLE_ACCTS:
+                dr_info = name_to_info.get(dr_name, {})
+                if dr_info.get("category", "") in EXPENSE_CATS and partner:
+                    if partner not in payable_lookup:
+                        payable_lookup[partner] = dr_name
+            continue
+
+        # 銀行仕訳: CF行を生成
+        bank_hit += 1
+        if dr_is_bank:
+            net          = dr_amt     # 借方=銀行: 入金(+)
+            counter_name = cr_name
+        else:
+            net          = -cr_amt    # 貸方=銀行: 出金(-)
+            counter_name = dr_name
+
+        counter_info = name_to_info.get(counter_name, {})
+        bank_entries.append({
+            "date":        date_str,
+            "amount":      net,
+            "partner":     partner,
+            "account":     counter_name,
+            "account_cat": counter_info.get("category", ""),
+            "account_aid": counter_info.get("id"),
+            "description": desc,
+            "source":      "journals_csv",
+        })
+
+    if debug:
+        st.caption(f"　仕訳帳CSV: 総行数 {total_rows}行 → 銀行含む {bank_hit}行 "
+                   f"/ payable_lookup: {len(payable_lookup)}件")
+
+    return bank_entries, payable_lookup
+
+
 def _paginate(path, key, token, company_id, params):
     """ページネーション付きAPIを全件取得。
     freee APIによって total_count の場所が異なるため複数パスで探す。"""
@@ -225,12 +347,14 @@ def _paginate(path, key, token, company_id, params):
     return result
 
 def get_all_transactions(token, company_id, bank_account_item_ids, start_date, end_date, acct_map,
-                         debug=False):
+                         bank_wid_to_aid=None, debug=False):
     """deals + manual_journals を全件取得。
+    bank_wid_to_aid : {walletable_id → account_item_id} — deals.payments の銀行判定に使用
     Returns: (bank_entries, payable_lookup)
       bank_entries   : 銀行口座が含まれる仕訳のリスト
       payable_lookup : {partner_name: expense_account_name} — 未払金経由払いの費用科目マップ
     """
+    bank_wid_to_aid = bank_wid_to_aid or {}
     params = {"start_issue_date": start_date, "end_issue_date": end_date}
     bank_entries   = []
     payable_lookup = {}  # partner_name → expense_account_name
@@ -310,17 +434,51 @@ def get_all_transactions(token, company_id, bank_account_item_ids, start_date, e
         deals_raw = len(deals)
         for deal in deals:
             raw_details  = deal.get("details") or []
+            payments     = deal.get("payments") or []
             deal_partner = deal.get("partner_name") or deal.get("partner_long_name") or ""
             norm_details = _norm_details(raw_details, has_account_name=True)
-            _update_payable_lookup(norm_details, deal_partner)
-            if not any(d.get("account_item_id") in bank_account_item_ids for d in raw_details):
+
+            # 銀行 payments がある deals は payable_lookup 対象外（発生仕訳ではなく入出金）
+            has_bank_payment = bool(bank_wid_to_aid) and any(
+                p.get("from_walletable_id") in bank_wid_to_aid for p in payments)
+            if not has_bank_payment:
+                _update_payable_lookup(norm_details, deal_partner)
+
+            # ① details に銀行 account_item_id がある場合（従来パターン）
+            if any(d.get("account_item_id") in bank_account_item_ids for d in raw_details):
+                deals_hit += 1
+                bank_entries.append({
+                    "issue_date":   deal.get("issue_date", ""),
+                    "partner_name": deal_partner,
+                    "details":      norm_details,
+                })
                 continue
-            deals_hit += 1
-            bank_entries.append({
-                "issue_date":   deal.get("issue_date", ""),
-                "partner_name": deal_partner,
-                "details":      norm_details,
-            })
+
+            # ② payments[].from_walletable_id が銀行の場合（自動で経理・settled deals）
+            # 銀行側の detail を合成して bank_entries に追加する
+            deal_type = deal.get("type", "")  # "income" or "expense"
+            for pmt in payments:
+                wid      = pmt.get("from_walletable_id")
+                bank_aid = bank_wid_to_aid.get(wid)
+                if bank_aid is None:
+                    continue
+                deals_hit += 1
+                pmt_amount = pmt.get("amount", 0) or 0
+                # income: 銀行に入金（debit）, expense: 銀行から出金（credit）
+                bank_entry_side = "debit" if deal_type == "income" else "credit"
+                # 合成した銀行行を details に追加して extract_bank_lines が見つけられるようにする
+                synthetic_bank = {
+                    "account_item_id":   bank_aid,
+                    "account_item_name": "",       # extract_bank_lines → acct_map で解決
+                    "entry_side":        bank_entry_side,
+                    "amount":            pmt_amount,
+                    "partner_name":      deal_partner,
+                }
+                bank_entries.append({
+                    "issue_date":   pmt.get("date") or deal.get("issue_date", ""),
+                    "partner_name": deal_partner,
+                    "details":      norm_details + [synthetic_bank],
+                })
     except Exception as e:
         st.warning(f"deals取得エラー ({start_date}〜{end_date}): {e}")
 
@@ -677,6 +835,7 @@ def aggregate_cf(rows, lookup_rows, payable_lookup=None, acct_map=None):
                 cat = "販管費"
             row["_resolved"] = cat
             unclassified.append(row)
+        row["_cf_category"] = cat   # Excel出力用にタグ付け
         cats[cat] = cats.get(cat, 0) + row.get("amount", 0)
         # その他カテゴリの内訳を記録
         if cat == "その他":
@@ -700,6 +859,177 @@ def aggregate_cf(rows, lookup_rows, payable_lookup=None, acct_map=None):
         "_all_rows": rows,
         "_other_accounts": other_accounts,
     }
+
+# ============================================================
+# Excel明細出力
+# ============================================================
+_FINANCE_CATS = {"借入による収入", "貸付の回収", "貸付による支出", "借入の返済"}
+_ALL_CF_CATS  = [
+    "売上の入金", "原価", "広告宣伝費", "販管費", "人件費", "税金", "その他",
+    "借入による収入", "貸付の回収", "貸付による支出", "借入の返済",
+]
+
+def generate_excel_detail(cf_data, months, bank_names, verify_data=None):
+    """全月の銀行入出金明細を Excel ワークブックとして生成し bytes を返す。
+    列構成:
+      A: 入金/出金種別 (外部入金/外部出金/内部入金/内部出金)
+      B: カテゴリ (自動付与、ドロップダウン付き)
+      C: 日付
+      D: 取引先名
+      E: 内容
+      F: 入金額
+      G: 出金額
+      H: 理論残高
+      I: 実残高（月末のみ）
+      J: 差異（月末のみ）
+    """
+    if not _HAS_OPENPYXL:
+        return None
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "入出金明細"
+
+    # ---- スタイル定義 ----
+    hdr_fill    = PatternFill("solid", fgColor="1F4E79")
+    hdr_font    = Font(color="FFFFFF", bold=True, size=10)
+    inc_fill    = PatternFill("solid", fgColor="DDEEFF")   # 入金行：薄青
+    exp_fill    = PatternFill("solid", fgColor="FFEEEE")   # 出金行：薄赤
+    fin_fill    = PatternFill("solid", fgColor="EEF0FF")   # 財務行：薄紫
+    mon_fill    = PatternFill("solid", fgColor="FFF2CC")   # 月見出し：薄黄
+    mon_font    = Font(bold=True, size=10)
+    bal_font    = Font(bold=True)
+    num_align   = Alignment(horizontal="right")
+    ctr_align   = Alignment(horizontal="center")
+    thin        = Side(style="thin", color="CCCCCC")
+    brd         = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    def set_row_style(row_idx, fill, bold=False):
+        for col in range(1, 11):
+            cell = ws.cell(row=row_idx, column=col)
+            cell.fill = fill
+            cell.border = brd
+            if col in (6, 7, 8, 9, 10):
+                cell.alignment = num_align
+            elif col in (1, 2, 3):
+                cell.alignment = ctr_align
+            if bold:
+                cell.font = bal_font
+
+    # ---- ヘッダー行 ----
+    headers = ["入金/出金", "カテゴリ", "日付", "取引先名", "内容",
+               "入金額", "出金額", "理論残高", "実残高", "差異"]
+    for c, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=c, value=h)
+        cell.fill = hdr_fill
+        cell.font = hdr_font
+        cell.alignment = ctr_align
+        cell.border = brd
+
+    # 列幅
+    col_widths = [12, 16, 12, 24, 32, 14, 14, 16, 14, 12]
+    for i, w in enumerate(col_widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    ws.freeze_panes = "A2"
+
+    # データバリデーション（カテゴリドロップダウン）
+    dv_formula = '"' + ",".join(_ALL_CF_CATS) + '"'
+    dv = DataValidation(type="list", formula1=dv_formula, allow_blank=True)
+    dv.sqref = "B2:B9999"
+    ws.add_data_validation(dv)
+
+    current_row = 2
+    verify_data = verify_data or {}
+
+    def mk(m):
+        return f"{m['year']}-{m['month']}"
+
+    for mon in months:
+        key     = mk(mon)
+        d       = cf_data.get(key, {})
+        rows    = sorted(d.get("_all_rows", []), key=lambda r: r.get("date", ""))
+        opening = d.get("openingBalance", 0) or 0
+        closing = d.get("closingBalance", 0) or 0
+        actual  = verify_data.get(key, None)
+
+        # ---- 月見出し行 ----
+        ws.merge_cells(start_row=current_row, start_column=1,
+                       end_row=current_row, end_column=10)
+        cell = ws.cell(row=current_row, column=1,
+                       value=f"━━ {mon['year']}年{mon['month']}月 ━━")
+        cell.fill = mon_fill
+        cell.font = mon_font
+        cell.alignment = Alignment(horizontal="left")
+        cell.border = brd
+        current_row += 1
+
+        # ---- 前月繰越行 ----
+        ws.cell(row=current_row, column=1, value="繰越")
+        ws.cell(row=current_row, column=3, value=f"{mon['year']}/{mon['month']:02d}/01")
+        ws.cell(row=current_row, column=5, value="前月繰越残高")
+        ws.cell(row=current_row, column=8, value=opening)
+        set_row_style(current_row, PatternFill("solid", fgColor="F5F5F5"), bold=True)
+        current_row += 1
+
+        running = opening
+
+        for row in rows:
+            amount  = row.get("amount", 0) or 0
+            cat     = row.get("_cf_category", "販管費")
+            is_fin  = cat in _FINANCE_CATS
+            is_inc  = amount >= 0
+
+            if is_fin:
+                kind = "内部入金" if is_inc else "内部出金"
+                fill = fin_fill
+            else:
+                kind = "外部入金" if is_inc else "外部出金"
+                fill = inc_fill if is_inc else exp_fill
+
+            running += amount
+
+            date_val = row.get("date", "")
+            try:
+                import datetime as _dt
+                date_disp = _dt.date.fromisoformat(date_val).strftime("%Y/%m/%d")
+            except Exception:
+                date_disp = date_val
+
+            ws.cell(row=current_row, column=1, value=kind)
+            ws.cell(row=current_row, column=2, value=cat)
+            ws.cell(row=current_row, column=3, value=date_disp)
+            ws.cell(row=current_row, column=4, value=row.get("partner", ""))
+            ws.cell(row=current_row, column=5, value=row.get("description", "") or row.get("account", ""))
+            if amount > 0:
+                ws.cell(row=current_row, column=6, value=amount)
+            else:
+                ws.cell(row=current_row, column=7, value=abs(amount))
+            ws.cell(row=current_row, column=8, value=int(running))
+            set_row_style(current_row, fill)
+            current_row += 1
+
+        # ---- 月末残高行 ----
+        ws.cell(row=current_row, column=1, value="月末残高")
+        ws.cell(row=current_row, column=3,
+                value=f"{mon['year']}/{mon['month']:02d}/{monthrange(mon['year'], mon['month'])[1]:02d}")
+        ws.cell(row=current_row, column=5, value="月末残高")
+        ws.cell(row=current_row, column=8, value=int(closing))
+        if actual is not None:
+            ws.cell(row=current_row, column=9, value=int(actual))
+            ws.cell(row=current_row, column=10, value=int(closing) - int(actual))
+        set_row_style(current_row, PatternFill("solid", fgColor="E8F5E9"), bold=True)
+        current_row += 1
+
+        # 空白行
+        current_row += 1
+
+    # bytes として返す
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
 
 # ============================================================
 # HTML生成
@@ -1065,6 +1395,21 @@ if generate_btn:
 
     bank_account_item_ids = set(bank_id_map.values())
 
+    # walletable_id → account_item_id マッピング（deals.payments の銀行判定に使用）
+    bank_wid_to_aid = {}
+    for w in bank_accounts:
+        wid  = w.get("id")
+        name = w.get("name", "")
+        aid  = bank_id_map.get(name)
+        if wid and aid:
+            bank_wid_to_aid[wid] = aid
+    # KNOWN_WALLETABLE_IDS フォールバック補完
+    for name, wid in KNOWN_WALLETABLE_IDS.items():
+        if name in bank_names and wid not in bank_wid_to_aid:
+            aid = bank_id_map.get(name)
+            if aid:
+                bank_wid_to_aid[wid] = aid
+
     # 科目マスタ取得（manual_journals の account_item_name 補完に使用）
     try:
         acct_map = get_account_items(token, company_id)
@@ -1080,6 +1425,7 @@ if generate_btn:
 
     if debug_mode:
         st.info(f"銀行口座IDマップ: {bank_id_map}")
+        st.info(f"walletable_id→aid マップ: {bank_wid_to_aid}")
         st.info(f"科目マスタ件数: {len(acct_map)}")
         st.info(f"決算月: {fy_end_month}月")
 
@@ -1098,9 +1444,8 @@ if generate_btn:
         pre_last   = monthrange(pre_year, pre_month)[1]
         pre_s      = f"{pre_year}-{pre_month:02d}-01"
         pre_e      = f"{pre_year}-{pre_month:02d}-{pre_last}"
-        _, pre_payable = get_all_transactions(
-            token, company_id, bank_account_item_ids,
-            pre_s, pre_e, acct_map, debug=False)
+        _, pre_payable = get_journals_bank_entries(
+            token, company_id, bank_names, pre_s, pre_e, acct_map, debug=False)
         cumulative_payable.update(pre_payable)
         if debug_mode and pre_payable:
             st.caption(f"前月({pre_year}/{pre_month}) payable先読み: {len(pre_payable)}件 — {list(pre_payable.items())[:5]}")
@@ -1115,21 +1460,20 @@ if generate_btn:
         e_date   = f"{mon['year']}-{mon['month']:02d}-{last_day}"
         pct      = int(10 + (i / len(months)) * 70)
 
-        progress.progress(pct, text=f"{mon['year']}年{mon['month']}月 取引取得中...")
+        progress.progress(pct, text=f"{mon['year']}年{mon['month']}月 仕訳帳取得中...")
 
         try:
-            entries, month_payable = get_all_transactions(
-                token, company_id, bank_account_item_ids,
-                s_date, e_date, acct_map, debug=debug_mode)
+            # 仕訳帳CSVで全仕訳を一括取得（deals/振替伝票の区別なし）
+            all_rows, month_payable = get_journals_bank_entries(
+                token, company_id, bank_names, s_date, e_date, acct_map, debug=debug_mode)
             # 今月の payable_lookup を累積辞書にマージ（既存エントリは上書きしない）
             for k, v in month_payable.items():
                 if k not in cumulative_payable:
                     cumulative_payable[k] = v
             payable_lookup = cumulative_payable  # 累積版を使用
 
-            all_rows = extract_bank_lines(entries, bank_account_item_ids, acct_map=acct_map)
             if debug_mode:
-                st.info(f"{mon['year']}年{mon['month']}月: entries={len(entries)}, rows={len(all_rows)}, "
+                st.info(f"{mon['year']}年{mon['month']}月: 銀行仕訳 {len(all_rows)}行, "
                         f"今月payable={len(month_payable)}件, 累積payable={len(cumulative_payable)}件")
             progress.progress(pct + 5, text=f"{mon['year']}年{mon['month']}月 分類中...")
             agg = aggregate_cf(all_rows, all_rows_pool, payable_lookup=payable_lookup, acct_map=acct_map)
@@ -1161,6 +1505,7 @@ if generate_btn:
         "cf_data":     cf_data,
         "months":      months,
         "verify_data": verify_data,
+        "bank_names":  bank_names,
         "period_str":  f"{start_year}{start_month:02d}-{end_year}{end_month:02d}",
     })
     progress.progress(100, text="完了！")
@@ -1208,15 +1553,35 @@ if st.session_state.get("html_result"):
     components.html(html, height=800, scrolling=True)
     st.divider()
 
-    st.download_button(
-        label="⬇️ HTMLをダウンロード",
-        data=html.encode("utf-8"),
-        file_name=f"cashflow_{period_str}.html",
-        mime="text/html",
-        use_container_width=True,
-        type="primary",
-        on_click=lambda: None,
-    )
+    col_dl1, col_dl2 = st.columns(2)
+    with col_dl1:
+        st.download_button(
+            label="⬇️ HTMLをダウンロード",
+            data=html.encode("utf-8"),
+            file_name=f"cashflow_{period_str}.html",
+            mime="text/html",
+            use_container_width=True,
+            type="primary",
+            on_click=lambda: None,
+        )
+    with col_dl2:
+        if _HAS_OPENPYXL:
+            excel_bytes = generate_excel_detail(
+                cf_data, months,
+                st.session_state.get("bank_names", []),
+                verify_data,
+            )
+            if excel_bytes:
+                st.download_button(
+                    label="⬇️ 入出金明細（Excel）をダウンロード",
+                    data=excel_bytes,
+                    file_name=f"cashflow_detail_{period_str}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    type="secondary",
+                )
+        else:
+            st.warning("openpyxl がインストールされていないため Excel 出力は使用できません。`pip install openpyxl` を実行してください。")
 
     if debug_mode:
         for mon in months:
